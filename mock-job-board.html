@@ -1,4 +1,12 @@
 <!DOCTYPE html>
+<!--
+  Offline sample job board.
+
+  The `mock-board` source in config/sources.js parses this file, so the whole
+  pipeline (scrape -> score -> store -> dashboard) can be demonstrated with no
+  network access and no API key. The class names mirror the structure of a
+  typical server-rendered job board.
+-->
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -26,6 +34,42 @@
             Must be proficient in Python, PostgreSQL, and AWS.
         </div>
         <a class="apply-btn" href="https://datasystems.example.com/careers/55">Apply Now</a>
+    </div>
+
+    <div class="job-listing">
+        <h2 class="job-title">Flutter Mobile Engineer</h2>
+        <div class="company-name">Bright Apps Studio</div>
+        <div class="date-posted">2026-07-23</div>
+        <div class="job-description">
+            Build and ship cross-platform mobile apps in Flutter and Dart for iOS and Android.
+            You will work closely with our Node.js API team, handle offline-first storage,
+            push notifications and store releases. Experience with BLoC or Provider expected.
+        </div>
+        <a class="apply-btn" href="https://brightapps.example.com/jobs/flutter-engineer">Apply Now</a>
+    </div>
+
+    <div class="job-listing">
+        <h2 class="job-title">Java / Spring Boot Microservices Developer</h2>
+        <div class="company-name">Fintech Core Systems</div>
+        <div class="date-posted">2026-07-20</div>
+        <div class="job-description">
+            Design and maintain payment microservices using Java 17, Spring Boot, Spring Data JPA and
+            Spring Security. Strong SQL skills (PostgreSQL) and REST API design required.
+            Docker and CI/CD exposure preferred.
+        </div>
+        <a class="apply-btn" href="https://fintechcore.example.com/positions/9021">Apply Now</a>
+    </div>
+
+    <div class="job-listing">
+        <h2 class="job-title">Site Reliability Engineer (Kubernetes)</h2>
+        <div class="company-name">CloudScale Ops</div>
+        <div class="date-posted">2026-07-19</div>
+        <div class="job-description">
+            Own our multi-region Kubernetes platform. Deep experience with Terraform, Helm, Go,
+            Prometheus and incident response required. This is a pure infrastructure role with
+            no application development.
+        </div>
+        <a class="apply-btn" href="https://cloudscale.example.com/roles/sre-k8s">Apply Now</a>
     </div>
 </body>
 </html>

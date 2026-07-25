@@ -3,35 +3,86 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Job Automation Dashboard</title>
+    <title>Job Match Dashboard</title>
     <link rel="stylesheet" href="style.css">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎯</text></svg>">
 </head>
 <body>
     <div class="container">
-        <header>
-            <h1>Job Match Dashboard</h1>
-            <button id="exportBtn" class="btn">Export to Excel</button>
+        <header class="page-header">
+            <div>
+                <h1>Job Match Dashboard</h1>
+                <p class="subtitle" id="subtitle">Daily scraped postings, scored against your resume.</p>
+            </div>
+            <div class="header-actions">
+                <button id="scrapeBtn" class="btn btn-ghost" title="Run the scraper now instead of waiting for the nightly cron">
+                    Run Scrape Now
+                </button>
+                <button id="exportBtn" class="btn btn-primary" title="Download the jobs currently shown in the table">
+                    Export to Excel
+                </button>
+            </div>
         </header>
 
+        <!-- Aggregate counters -->
+        <section class="stats" id="stats">
+            <div class="stat-card">
+                <span class="stat-label">Jobs tracked</span>
+                <span class="stat-value" id="statTotal">-</span>
+            </div>
+            <div class="stat-card">
+                <span class="stat-label">Strong matches (70+)</span>
+                <span class="stat-value accent-good" id="statStrong">-</span>
+            </div>
+            <div class="stat-card">
+                <span class="stat-label">Average score</span>
+                <span class="stat-value" id="statAverage">-</span>
+            </div>
+            <div class="stat-card">
+                <span class="stat-label">Last scrape</span>
+                <span class="stat-value stat-value-sm" id="statLastRun">-</span>
+            </div>
+        </section>
+
+        <!-- Filters -->
+        <section class="toolbar">
+            <input type="search" id="searchInput" class="input" placeholder="Filter by title or company..." autocomplete="off">
+            <label class="slider-label" for="minScore">
+                Min score
+                <input type="range" id="minScore" min="0" max="100" step="5" value="0">
+                <output id="minScoreValue">0</output>
+            </label>
+            <span class="result-count" id="resultCount"></span>
+        </section>
+
         <main>
-            <table id="jobsTable">
-                <thead>
-                    <tr>
-                        <th>Job Title</th>
-                        <th>Company</th>
-                        <th>Match Score (%)</th>
-                        <th>Date Posted</th>
-                        <th>Action</th>
-                    </tr>
-                </thead>
-                <tbody id="jobsTableBody">
-                    <!-- Data will be populated here by script.js -->
-                </tbody>
-            </table>
+            <div class="table-wrap">
+                <table id="jobsTable">
+                    <thead>
+                        <tr>
+                            <th data-sort="title" class="sortable">Job Title</th>
+                            <th data-sort="company" class="sortable">Company</th>
+                            <th data-sort="score" class="sortable sorted-desc">Match Score (%)</th>
+                            <th data-sort="datePosted" class="sortable">Date</th>
+                            <th>Action</th>
+                        </tr>
+                    </thead>
+                    <tbody id="jobsTableBody">
+                        <tr><td colspan="5" class="empty">Loading jobs...</td></tr>
+                    </tbody>
+                </table>
+            </div>
         </main>
+
+        <footer class="page-footer">
+            <span id="footerStatus">Ready.</span>
+        </footer>
     </div>
 
-    <!-- SheetJS (xlsx) for Excel Export -->
+    <!-- Toast notifications -->
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+    <!-- SheetJS (xlsx) for the Excel export; script.js falls back to CSV if it fails to load. -->
     <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
     <script src="script.js"></script>
 </body>

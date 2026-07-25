@@ -1,16 +1,25 @@
 {
-  "name": "app",
+  "name": "job-application-bot",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Daily job scraper that scores postings against your resume with an LLM and serves them on a dashboard with Excel export.",
+  "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "scrape": "node scripts/scrape.js",
+    "test": "node --test tests/*.test.js"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Rishi1435/Job-Application-bot.git"
   },
-  "keywords": [],
+  "keywords": [
+    "job-scraper",
+    "resume-matching",
+    "puppeteer",
+    "cheerio",
+    "llm"
+  ],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
@@ -27,7 +36,13 @@
     "openai": "^6.48.0",
     "sqlite3": "^6.0.1"
   },
+  "optionalDependencies": {
+    "puppeteer": "^24.10.0"
+  },
   "devDependencies": {
     "playwright": "^1.61.1"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }

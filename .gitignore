@@ -1,2 +1,21 @@
 node_modules/
 .package-lock.json
+
+# Secrets
+.env
+.env.local
+
+# Local database + exports
+*.sqlite
+*.sqlite-journal
+*.xlsx
+*.csv
+
+# Personal resume text
+resume.txt
+
+# Logs / OS noise
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
