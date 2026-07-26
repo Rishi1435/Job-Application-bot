@@ -1,281 +1,377 @@
 /**
- * Crawler module.
+ * Scraping engine (Puppeteer).
  *
- * Walks every enabled source in `config/sources.js`, extracts postings, scores
- * the *new* ones with the resume matcher, and persists them to SQLite.
+ * Visits only the career pages declared in `config/sources.js`, keeps only the
+ * postings whose employer is on the `TRUSTED_COMPANIES` allow-list, then hands
+ * each posting to the matcher once per tenant and stores the result.
  *
- * Fetch strategies:
- *   file    - local HTML (offline demo board)
- *   static  - axios + Cheerio for server-rendered boards
- *   dynamic - Puppeteer render + Cheerio for JavaScript-rendered boards
- *   json    - public JSON endpoints mapped by the source definition
+ * Shape of a run:
+ *   1. collectJobs()      one browser, one pass over the sources -> postings
+ *   2. per user           match against that user's resumes -> match_data
+ *   3. per user           upsert into `jobs` (user_id + apply_url is unique)
  *
- * Politeness / basic block avoidance:
- *   - realistic browser headers (User-Agent, Accept, Accept-Language)
- *   - randomised delay between requests
- *   - exponential backoff on 429 / 5xx / socket errors
- *   - per-source failures are isolated: one dead board never aborts the run
+ * The crawl is shared across tenants (the boards are public and identical for
+ * everyone), while scoring and storage are strictly per user.
+ *
+ * Chromium flags target containers: `--no-sandbox` and `--disable-setuid-sandbox`
+ * because the image runs without user namespaces, `--disable-dev-shm-usage`
+ * because Docker's default /dev/shm (64 MB) is too small for Chromium and makes
+ * it crash mid-render.
  */
 
 const fs = require('fs');
 const path = require('path');
-const axios = require('axios');
 
-const { getEnabledSources } = require('../config/sources');
-const { clean, normalizeDate, absoluteUrl, parseHtml } = require('./parser');
-const { insertJob, jobExists, startRun, finishRun } = require('./database');
-const { matchJobs } = require('./matcher');
+const { getEnabledSources, isTrustedCompany, canonicalCompany } = require('../config/sources');
+const { clean, normalizeDate, absoluteUrl, parseHtml, extractText } = require('./parser');
+const { upsertJob, jobExists, getResumes, listUsers } = require('./database');
+const { matchJobsForUser } = require('./matcher');
 
 const USER_AGENT =
   process.env.SCRAPER_USER_AGENT ||
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
-const REQUEST_TIMEOUT_MS = Number(process.env.SCRAPER_TIMEOUT_MS || 20000);
-const MAX_RETRIES = Number(process.env.SCRAPER_MAX_RETRIES || 3);
+const NAV_TIMEOUT_MS = Number(process.env.SCRAPER_TIMEOUT_MS || 30000);
+const SELECTOR_TIMEOUT_MS = Number(process.env.SCRAPER_SELECTOR_TIMEOUT_MS || 10000);
 const MIN_DELAY_MS = Number(process.env.SCRAPER_MIN_DELAY_MS || 800);
 const MAX_DELAY_MS = Number(process.env.SCRAPER_MAX_DELAY_MS || 2200);
+/** How many job pages are opened per board to read the full description. */
+const DETAIL_LIMIT = Number(process.env.SCRAPER_DETAIL_LIMIT || 5);
+const DETAIL_MIN_CHARS = Number(process.env.SCRAPER_DETAIL_MIN_CHARS || 400);
 
 /** Guards against overlapping runs (cron firing while a manual run is active). */
 let running = false;
-
-/* ------------------------------------------------------------------ */
-/* Small utilities                                                     */
-/* ------------------------------------------------------------------ */
+/** Summary of the most recent run, surfaced by `GET /api/status`. */
+let lastRun = null;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** Randomised pause between requests so traffic does not look robotic. */
+/** Randomised pause between page loads so traffic does not look robotic. */
 const politeDelay = () => sleep(MIN_DELAY_MS + Math.floor(Math.random() * Math.max(1, MAX_DELAY_MS - MIN_DELAY_MS)));
 
-/**
- * @param {any} error
- * @returns {boolean} whether the request is worth retrying
- */
-function isRetryable(error) {
-  const status = error?.response?.status;
-  if (status === 429 || status === 408) return true;
-  if (status >= 500 && status < 600) return true;
-  return ['ETIMEDOUT', 'ECONNABORTED', 'ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN', 'ENOTFOUND'].includes(error?.code);
-}
-
 /* ------------------------------------------------------------------ */
-/* Fetchers                                                            */
+/* Browser                                                             */
 /* ------------------------------------------------------------------ */
 
 /**
- * Decodes a raw response body to a string using the charset advertised in
- * `Content-Type`, defaulting to UTF-8 (which is what nearly every board serves,
- * even when it forgets to say so).
+ * Launches Chromium with container-safe flags.
  *
- * @param {{data: Buffer|ArrayBuffer, headers: object}} response axios response
- * @returns {string}
- */
-function decodeBody(response) {
-  const contentType = String(response.headers?.['content-type'] || '');
-  const charset = (contentType.match(/charset=([^;]+)/i)?.[1] || 'utf-8').trim().toLowerCase();
-  const buffer = Buffer.from(response.data);
-
-  try {
-    return new TextDecoder(charset).decode(buffer);
-  } catch {
-    // Unknown/bogus charset label - UTF-8 is the safest guess.
-    return buffer.toString('utf-8');
-  }
-}
-
-/**
- * HTTP GET with browser-like headers and exponential backoff.
+ * In the Docker image Chromium is installed by apt and
+ * `PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium` points at it; locally the flag
+ * is unset and Puppeteer uses its own download.
  *
- * @param {string} url
- * @param {{json?:boolean}} [options]
- * @returns {Promise<any>} response body (parsed object when `json` is set)
+ * @returns {Promise<import('puppeteer').Browser>}
  */
-async function httpGet(url, options = {}) {
-  let lastError;
+async function launchBrowser() {
+  const puppeteer = require('puppeteer');
 
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt += 1) {
-    try {
-      const response = await axios.get(url, {
-        timeout: REQUEST_TIMEOUT_MS,
-        maxRedirects: 5,
-        // Some boards return 403 for "unknown" clients; look like a real browser.
-        headers: {
-          'User-Agent': USER_AGENT,
-          Accept: options.json
-            ? 'application/json,text/plain,*/*'
-            : 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.9',
-          'Cache-Control': 'no-cache',
-          Pragma: 'no-cache',
-          'Upgrade-Insecure-Requests': '1',
-        },
-        // Raw bytes, decoded below. Letting axios decode strings mangles UTF-8
-        // on responses whose Content-Type omits a charset (RemoteOK does).
-        responseType: 'arraybuffer',
-        validateStatus: (status) => status >= 200 && status < 400,
-      });
-
-      const body = decodeBody(response);
-      return options.json ? JSON.parse(body) : body;
-    } catch (error) {
-      lastError = error;
-      if (!isRetryable(error) || attempt === MAX_RETRIES) break;
-      const backoff = 1500 * 2 ** (attempt - 1) + Math.floor(Math.random() * 500);
-      console.warn(`[scraper] GET ${url} failed (${error.message}); retry ${attempt}/${MAX_RETRIES - 1} in ${backoff}ms`);
-      await sleep(backoff);
-    }
-  }
-
-  const status = lastError?.response?.status;
-  throw new Error(`GET ${url} failed${status ? ` with HTTP ${status}` : ''}: ${lastError?.message}`);
-}
-
-/**
- * Renders a JavaScript-driven page with Puppeteer and returns its HTML.
- * Puppeteer is required lazily so the app still boots when it is not installed.
- *
- * @param {object} source source definition
- * @returns {Promise<string>} rendered HTML
- */
-async function renderWithPuppeteer(source) {
-  let puppeteer;
-  try {
-    // eslint-disable-next-line global-require
-    puppeteer = require('puppeteer');
-  } catch {
-    throw new Error("Puppeteer is not installed - run 'npm install puppeteer' to enable dynamic sources.");
-  }
-
-  const browser = await puppeteer.launch({
+  return puppeteer.launch({
     headless: 'new',
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled'],
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--no-zygote',
+      '--disable-blink-features=AutomationControlled',
+    ],
+  });
+}
+
+/**
+ * Opens a tab configured to look like an ordinary browser.
+ *
+ * @param {import('puppeteer').Browser} browser
+ * @returns {Promise<import('puppeteer').Page>}
+ */
+async function newPage(browser) {
+  const page = await browser.newPage();
+  await page.setUserAgent(USER_AGENT);
+  await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
+  await page.setViewport({ width: 1366, height: 900 });
+  page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
+
+  // Hide the most obvious automation tell-tale.
+  await page.evaluateOnNewDocument(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
   });
 
-  try {
-    const page = await browser.newPage();
-    await page.setUserAgent(USER_AGENT);
-    await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
-    await page.setViewport({ width: 1366, height: 900 });
+  return page;
+}
 
-    // Hide the most obvious automation tell-tale.
-    await page.evaluateOnNewDocument(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+/**
+ * Loads a URL and returns its rendered HTML.
+ *
+ * @param {import('puppeteer').Page} page
+ * @param {string} url
+ * @param {string|null} [waitForSelector] extra wait once navigation settles
+ * @returns {Promise<string>}
+ */
+async function renderPage(page, url, waitForSelector) {
+  await page.goto(url, { waitUntil: 'networkidle2', timeout: NAV_TIMEOUT_MS });
+
+  if (waitForSelector) {
+    // A miss is not fatal: boards restyle constantly and the generic fallback
+    // below can still find postings in whatever did render.
+    await page.waitForSelector(waitForSelector, { timeout: SELECTOR_TIMEOUT_MS }).catch(() => {});
+  }
+
+  return page.content();
+}
+
+/* ------------------------------------------------------------------ */
+/* Extraction                                                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Last-resort extraction for boards whose selectors have changed: scans anchors
+ * whose href looks like a job permalink and treats their text as the title.
+ *
+ * @param {string} html rendered markup
+ * @param {object} source source definition
+ * @returns {Array<{title:string, applyUrl:string, description:string}>}
+ */
+function genericAnchorScan(html, source) {
+  const cheerio = require('cheerio');
+  const $ = cheerio.load(html);
+  const pattern = source.jobUrlPattern || /(job|career|position|opening)/i;
+  const seen = new Set();
+  const jobs = [];
+
+  $('a[href]').each((_, element) => {
+    const node = $(element);
+    const href = node.attr('href') || '';
+    const url = absoluteUrl(href, source.baseUrl);
+    const title = clean(node.text());
+
+    if (!url || !title || title.length < 4 || title.length > 160) return;
+    if (!pattern.test(url)) return;
+    if (seen.has(url)) return;
+
+    seen.add(url);
+    jobs.push({ title, applyUrl: url, description: clean(node.parent().text()).slice(0, 400) });
+  });
+
+  return jobs;
+}
+
+/**
+ * Hosts that answer a posting URL with a 301 to somewhere else. Following the
+ * redirect ourselves keeps the stored link stable: the browser still lands on
+ * the right page either way, but a link that visibly bounces looks broken, and
+ * some corporate proxies and in-app browsers drop the query string across the
+ * hop - which is how `?gh_jid=...` gets lost and the board shows its index page
+ * instead of the job.
+ */
+const HOST_REWRITES = {
+  'boards.greenhouse.io': 'job-boards.greenhouse.io',
+  'boards.eu.greenhouse.io': 'job-boards.eu.greenhouse.io',
+};
+
+/** Query parameters that only exist for analytics and can safely be dropped. */
+const TRACKING_PARAMS = /^(utm_|gh_src$|ref$|source$|rx$|fbclid$|gclid$)/i;
+
+/**
+ * Canonicalises an apply URL so the link in the dashboard opens the posting
+ * directly.
+ *
+ * Returns null for anything that is not plain http(s) - the href is written
+ * straight into an anchor, so a `javascript:` or `data:` URL that slipped out of
+ * a career page must never reach the DOM.
+ *
+ * @param {string} url absolute URL from `absoluteUrl()`
+ * @returns {string|null} canonical URL, or null when it is unusable
+ */
+function normalizeApplyUrl(url) {
+  if (!url) return null;
+
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return null;
+
+  const rewrite = HOST_REWRITES[parsed.hostname.toLowerCase()];
+  if (rewrite) parsed.hostname = rewrite;
+
+  for (const key of [...parsed.searchParams.keys()]) {
+    if (TRACKING_PARAMS.test(key)) parsed.searchParams.delete(key);
+  }
+
+  // Greenhouse repeats the posting id in the path and in `gh_jid`; the bare
+  // path is the canonical permalink.
+  if (/greenhouse\.io$/i.test(parsed.hostname) && /\/jobs\/\d+/.test(parsed.pathname)) {
+    parsed.searchParams.delete('gh_jid');
+  }
+
+  parsed.hash = '';
+  return parsed.toString();
+}
+
+/**
+ * Normalises raw extraction output and drops anything not on the allow-list.
+ *
+ * The board's own company (from `config/sources.js`) wins over whatever the
+ * markup claims, because a single-company career page is authoritative; the
+ * scraped value is only used when the source does not declare one.
+ *
+ * @param {Array<object>} rawJobs
+ * @param {object} source
+ * @returns {{jobs:Array<object>, rejected:number}}
+ */
+function normalizeAndFilter(rawJobs, source) {
+  let rejected = 0;
+
+  const jobs = rawJobs
+    .map((job) => {
+      const company = clean(job.company) || source.company || '';
+      return {
+        title: clean(job.title),
+        company,
+        location: clean(job.location),
+        description: clean(job.description),
+        applyUrl: normalizeApplyUrl(absoluteUrl(job.applyUrl, source.baseUrl)),
+        datePosted: normalizeDate(job.datePosted),
+        sourceId: source.id,
+      };
+    })
+    .filter((job) => job.title && job.applyUrl)
+    .filter((job) => {
+      // The allow-list is the whole point of the "trusted companies" design:
+      // anything we cannot attribute to a known employer is discarded.
+      if (isTrustedCompany(job.company)) {
+        job.company = canonicalCompany(job.company);
+        return true;
+      }
+      rejected += 1;
+      return false;
     });
 
-    await page.goto(source.url, { waitUntil: 'networkidle2', timeout: REQUEST_TIMEOUT_MS });
+  // De-duplicate within the source (boards repeat postings across departments).
+  const seen = new Set();
+  const unique = jobs.filter((job) => {
+    if (seen.has(job.applyUrl)) return false;
+    seen.add(job.applyUrl);
+    return true;
+  });
 
-    if (source.waitForSelector) {
-      await page.waitForSelector(source.waitForSelector, { timeout: REQUEST_TIMEOUT_MS });
+  return { jobs: Number.isFinite(source.maxJobs) ? unique.slice(0, source.maxJobs) : unique, rejected };
+}
+
+/**
+ * Opens individual job pages to replace thin listing blurbs with the real
+ * description, which is what the matcher actually reasons over. Capped by
+ * `SCRAPER_DETAIL_LIMIT` so a run stays bounded.
+ *
+ * @param {import('puppeteer').Page} page
+ * @param {Array<object>} jobs mutated in place
+ * @param {object} source
+ * @returns {Promise<void>}
+ */
+async function enrichDescriptions(page, jobs, source) {
+  if (!source.detail || DETAIL_LIMIT <= 0) return;
+
+  let opened = 0;
+  for (const job of jobs) {
+    if (opened >= DETAIL_LIMIT) break;
+    if ((job.description || '').length >= DETAIL_MIN_CHARS) continue;
+
+    try {
+      const html = await renderPage(page, job.applyUrl, null);
+      const text = extractText(html, source.detail);
+      if (text.length > (job.description || '').length) job.description = text.slice(0, 20000);
+      opened += 1;
+      await politeDelay();
+    } catch (error) {
+      console.warn(`[scraper] Could not open ${job.applyUrl}: ${error.message}`);
     }
-
-    return await page.content();
-  } finally {
-    await browser.close().catch(() => {});
   }
 }
 
-/* ------------------------------------------------------------------ */
-/* Source handling                                                     */
-/* ------------------------------------------------------------------ */
-
 /**
- * Fetches and parses one source into normalised job records.
+ * Scrapes one source into normalised, allow-listed postings.
  *
+ * @param {import('puppeteer').Browser|null} browser null for `file` sources
  * @param {object} source source definition
- * @returns {Promise<Array<object>>} normalised jobs tagged with their source
+ * @returns {Promise<Array<object>>}
  */
-async function scrapeSource(source) {
-  let rawJobs = [];
+async function scrapeSource(browser, source) {
+  let html;
+  let page = null;
 
-  switch (source.mode) {
-    case 'file': {
-      const filePath = path.resolve(__dirname, '..', source.filePath);
-      const html = fs.readFileSync(filePath, 'utf-8');
-      rawJobs = parseHtml(html, source);
-      break;
-    }
-    case 'static': {
-      const html = await httpGet(source.url);
-      rawJobs = parseHtml(html, source);
-      break;
-    }
-    case 'dynamic': {
-      const html = await renderWithPuppeteer(source);
-      rawJobs = parseHtml(html, source);
-      break;
-    }
-    case 'json': {
-      const payload = await httpGet(source.url, { json: true });
-      rawJobs = typeof source.map === 'function' ? source.map(payload) : [];
-      break;
-    }
-    default:
-      throw new Error(`Unknown source mode "${source.mode}" for source "${source.id}"`);
+  if (source.ats === 'file') {
+    html = fs.readFileSync(path.resolve(__dirname, '..', source.filePath), 'utf-8');
+  } else {
+    page = await newPage(browser);
+    html = await renderPage(page, source.url, source.waitForSelector);
   }
 
-  const normalised = rawJobs
-    .map((job) => ({
-      title: clean(job.title),
-      company: clean(job.company) || 'Unknown',
-      description: clean(job.description),
-      applyUrl: absoluteUrl(job.applyUrl, source.baseUrl),
-      datePosted: normalizeDate(job.datePosted),
-      sourceId: source.id,
-      sourceName: source.name,
-    }))
-    .filter((job) => job.title && job.applyUrl);
-
-  return Number.isFinite(source.maxJobs) ? normalised.slice(0, source.maxJobs) : normalised;
-}
-
-/* ------------------------------------------------------------------ */
-/* Orchestration                                                       */
-/* ------------------------------------------------------------------ */
-
-/**
- * Runs the full pipeline: scrape -> de-duplicate -> score -> persist.
- *
- * Jobs whose apply URL is already stored are *not* sent to the LLM again; they
- * only get their `lastSeenAt` / `timesSeen` counters refreshed.
- *
- * @param {{trigger?:'cron'|'manual'|'startup'}} [options]
- * @returns {Promise<{status:string, found:number, inserted:number, duplicates:number, scored:number, errors:Array<string>}>}
- */
-async function runScraper(options = {}) {
-  const trigger = options.trigger || 'manual';
-
-  if (running) {
-    console.warn('[scraper] A run is already in progress; skipping this trigger.');
-    return { status: 'skipped', found: 0, inserted: 0, duplicates: 0, scored: 0, errors: ['Run already in progress'] };
+  let rawJobs = parseHtml(html, source);
+  if (rawJobs.length === 0) {
+    rawJobs = genericAnchorScan(html, source);
+    if (rawJobs.length) {
+      console.warn(`[scraper] ${source.name}: selectors matched nothing, used the generic anchor scan.`);
+    }
   }
 
-  running = true;
-  const startedAt = Date.now();
-  const runId = await startRun(trigger);
-  const errors = [];
-  const summary = { found: 0, inserted: 0, duplicates: 0, scored: 0 };
+  const { jobs, rejected } = normalizeAndFilter(rawJobs, source);
+  if (rejected) {
+    console.log(`[scraper] ${source.name}: ${rejected} posting(s) dropped - employer not on the trusted list.`);
+  }
 
   try {
-    const sources = getEnabledSources();
-    console.log(`[scraper] Starting ${trigger} run across ${sources.length} source(s).`);
+    if (page) await enrichDescriptions(page, jobs, source);
+  } finally {
+    if (page) await page.close().catch(() => {});
+  }
 
-    /** @type {Array<object>} every posting seen this run, de-duplicated by URL */
-    const collected = [];
-    const seenUrls = new Set();
+  return jobs;
+}
 
+/**
+ * One crawl over every enabled source.
+ *
+ * @param {{sources?:Array<object>}} [options]
+ * @returns {Promise<{jobs:Array<object>, errors:Array<string>}>}
+ */
+async function collectJobs(options = {}) {
+  const sources = options.sources || getEnabledSources();
+  const errors = [];
+  const jobs = [];
+  const seen = new Set();
+
+  const needsBrowser = sources.some((source) => source.ats !== 'file');
+  let browser = null;
+
+  if (needsBrowser) {
+    try {
+      browser = await launchBrowser();
+    } catch (error) {
+      errors.push(`Could not launch Chromium: ${error.message}`);
+      console.error(`[scraper] ${errors[errors.length - 1]}`);
+    }
+  }
+
+  try {
     for (const source of sources) {
+      if (source.ats !== 'file' && !browser) continue; // browser failed to launch
+
       try {
-        const jobs = await scrapeSource(source);
+        const found = await scrapeSource(browser, source);
         let added = 0;
 
-        for (const job of jobs) {
-          if (seenUrls.has(job.applyUrl)) continue;
-          seenUrls.add(job.applyUrl);
-          collected.push(job);
+        for (const job of found) {
+          if (seen.has(job.applyUrl)) continue;
+          seen.add(job.applyUrl);
+          jobs.push(job);
           added += 1;
         }
 
-        console.log(`[scraper] ${source.name}: ${jobs.length} posting(s), ${added} unique.`);
+        console.log(`[scraper] ${source.name}: ${found.length} trusted posting(s), ${added} new to this run.`);
       } catch (error) {
         const message = `${source.name}: ${error.message}`;
         errors.push(message);
@@ -284,73 +380,178 @@ async function runScraper(options = {}) {
 
       await politeDelay();
     }
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
 
-    summary.found = collected.length;
+  return { jobs, errors };
+}
 
-    // Split into brand-new postings (need scoring) and ones already stored.
-    const fresh = [];
-    for (const job of collected) {
-      if (await jobExists(job.applyUrl)) {
-        await insertJob(job); // refreshes lastSeenAt / timesSeen
-        summary.duplicates += 1;
-      } else {
-        fresh.push(job);
+/* ------------------------------------------------------------------ */
+/* Per-tenant persistence                                              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Scores and stores an already-collected batch of postings for one user.
+ *
+ * Postings this user has already stored are refreshed but not re-sent to the
+ * LLM, so a nightly run only pays for genuinely new listings.
+ *
+ * @param {number} userId tenant
+ * @param {Array<object>} jobs postings from `collectJobs`
+ * @returns {Promise<{inserted:number, updated:number, scored:number, errors:Array<string>}>}
+ */
+async function saveJobsForUser(userId, jobs) {
+  const summary = { inserted: 0, updated: 0, scored: 0, errors: [] };
+  if (!jobs.length) return summary;
+
+  const resumes = await getResumes(userId);
+  const fresh = [];
+
+  for (const job of jobs) {
+    if (await jobExists(userId, job.applyUrl)) {
+      try {
+        await upsertJob(userId, job); // refresh title/description only
+        summary.updated += 1;
+      } catch (error) {
+        summary.errors.push(`Refresh failed for "${job.title}": ${error.message}`);
+      }
+    } else {
+      fresh.push(job);
+    }
+  }
+
+  if (!fresh.length) return summary;
+
+  const verdicts = await matchJobsForUser(userId, fresh, { resumes });
+
+  for (let i = 0; i < fresh.length; i += 1) {
+    const job = fresh[i];
+    const { engine, ...matchData } = verdicts[i] || {};
+
+    try {
+      const result = await upsertJob(userId, { ...job, matchData });
+      if (result.inserted) summary.inserted += 1;
+      else summary.updated += 1;
+      if (engine === 'llm') summary.scored += 1;
+    } catch (error) {
+      const message = `Failed to save "${job.title}": ${error.message}`;
+      summary.errors.push(message);
+      console.error(`[scraper] ${message}`);
+    }
+  }
+
+  return summary;
+}
+
+/**
+ * Full pipeline: crawl once, then score and store for each requested tenant.
+ *
+ * @param {{trigger?:'cron'|'manual'|'startup', userIds?:Array<number>}} [options]
+ *   `userIds` defaults to every registered user (that is what the cron run does).
+ * @returns {Promise<{status:string, found:number, inserted:number, updated:number, scored:number, users:number, errors:Array<string>, startedAt:string, finishedAt:string, durationMs:number}>}
+ */
+async function runScraper(options = {}) {
+  const trigger = options.trigger || 'manual';
+
+  if (running) {
+    console.warn('[scraper] A run is already in progress; skipping this trigger.');
+    return { status: 'skipped', found: 0, inserted: 0, updated: 0, scored: 0, users: 0, errors: ['Run already in progress'] };
+  }
+
+  running = true;
+  const startedAt = new Date();
+  const errors = [];
+  const totals = { found: 0, inserted: 0, updated: 0, scored: 0, users: 0 };
+
+  try {
+    const userIds = options.userIds || (await listUsers()).map((user) => user.id);
+    if (!userIds.length) {
+      console.warn('[scraper] No registered users - nothing to store.');
+    }
+
+    const sources = getEnabledSources();
+    console.log(`[scraper] Starting ${trigger} run across ${sources.length} source(s) for ${userIds.length} user(s).`);
+
+    const collected = await collectJobs({ sources });
+    errors.push(...collected.errors);
+    totals.found = collected.jobs.length;
+
+    for (const userId of userIds) {
+      try {
+        const summary = await saveJobsForUser(userId, collected.jobs);
+        totals.inserted += summary.inserted;
+        totals.updated += summary.updated;
+        totals.scored += summary.scored;
+        totals.users += 1;
+        errors.push(...summary.errors);
+        console.log(`[scraper] user ${userId}: ${summary.inserted} new, ${summary.updated} refreshed, ${summary.scored} LLM-scored.`);
+      } catch (error) {
+        const message = `user ${userId}: ${error.message}`;
+        errors.push(message);
+        console.error(`[scraper] ${message}`);
       }
     }
 
-    if (fresh.length > 0) {
-      console.log(`[scraper] Scoring ${fresh.length} new posting(s) against the resume...`);
-      const verdicts = await matchJobs(fresh);
+    const status = errors.length === 0 ? 'success' : totals.inserted > 0 || totals.updated > 0 ? 'partial' : 'failed';
+    const finishedAt = new Date();
 
-      for (let i = 0; i < fresh.length; i += 1) {
-        const job = fresh[i];
-        const verdict = verdicts[i] || { score: 0, reason: 'No verdict produced.' };
-        job.score = verdict.score;
-        job.reason = verdict.reason;
-
-        try {
-          const result = await insertJob(job);
-          if (result.status === 'inserted') {
-            summary.inserted += 1;
-            summary.scored += 1;
-            console.log(`[scraper] Saved "${job.title}" @ ${job.company} - score ${job.score}`);
-          } else {
-            summary.duplicates += 1;
-          }
-        } catch (error) {
-          const message = `Failed to save "${job.title}": ${error.message}`;
-          errors.push(message);
-          console.error(`[scraper] ${message}`);
-        }
-      }
-    }
-
-    const status = errors.length === 0 ? 'success' : summary.inserted > 0 ? 'partial' : 'failed';
-    await finishRun(runId, { status, ...summary, errors });
+    lastRun = {
+      status,
+      trigger,
+      ...totals,
+      errors,
+      startedAt: startedAt.toISOString(),
+      finishedAt: finishedAt.toISOString(),
+      durationMs: finishedAt - startedAt,
+    };
 
     console.log(
-      `[scraper] Run finished in ${((Date.now() - startedAt) / 1000).toFixed(1)}s - ` +
-        `${summary.found} found, ${summary.inserted} new, ${summary.duplicates} already seen, ${errors.length} error(s).`
+      `[scraper] Run finished in ${(lastRun.durationMs / 1000).toFixed(1)}s - ` +
+        `${totals.found} posting(s) found, ${totals.inserted} stored, ${errors.length} error(s).`
     );
 
-    return { status, ...summary, errors };
+    return lastRun;
   } catch (error) {
     console.error('[scraper] Run aborted:', error.message);
     errors.push(error.message);
-    await finishRun(runId, { status: 'failed', ...summary, errors });
-    return { status: 'failed', ...summary, errors };
+    const finishedAt = new Date();
+    lastRun = {
+      status: 'failed',
+      trigger,
+      ...totals,
+      errors,
+      startedAt: startedAt.toISOString(),
+      finishedAt: finishedAt.toISOString(),
+      durationMs: finishedAt - startedAt,
+    };
+    return lastRun;
   } finally {
     running = false;
   }
 }
 
+/**
+ * Convenience wrapper for the dashboard's "Run scrape now" button: crawls and
+ * stores for the calling user only.
+ *
+ * @param {number} userId
+ * @returns {Promise<object>} run summary
+ */
+function runScraperForUser(userId) {
+  return runScraper({ trigger: 'manual', userIds: [userId] });
+}
+
 module.exports = {
   runScraper,
+  runScraperForUser,
+  collectJobs,
   scrapeSource,
-  httpGet,
+  saveJobsForUser,
+  normalizeAndFilter,
+  normalizeApplyUrl,
+  genericAnchorScan,
+  launchBrowser,
   isRunning: () => running,
-  // Re-exported for convenience; the implementations live in ./parser.
-  parseHtml,
-  normalizeDate,
-  absoluteUrl,
+  getLastRun: () => lastRun,
 };

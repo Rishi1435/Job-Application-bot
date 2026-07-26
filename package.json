@@ -1,13 +1,15 @@
 {
   "name": "job-application-bot",
-  "version": "1.0.0",
-  "description": "Daily job scraper that scores postings against your resume with an LLM and serves them on a dashboard with Excel export.",
+  "version": "2.0.0",
+  "description": "Multi-tenant job automation bot: scrapes trusted company career pages, categorises roles as Internship or Full-Time with an NVIDIA-hosted LLM, scores them against each user's resumes and serves them on a dashboard with Excel export.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
     "scrape": "node scripts/scrape.js",
-    "test": "node --test tests/*.test.js"
+    "verify": "node tests/verify.js",
+    "test": "node --test tests/units.test.js tests/compensation.test.js tests/relevance.test.js",
+    "rescreen": "node scripts/rescreen.js"
   },
   "repository": {
     "type": "git",
@@ -17,7 +19,8 @@
     "job-scraper",
     "resume-matching",
     "puppeteer",
-    "cheerio",
+    "postgresql",
+    "multi-tenant",
     "llm"
   ],
   "author": "",
@@ -28,21 +31,20 @@
   },
   "homepage": "https://github.com/Rishi1435/Job-Application-bot#readme",
   "dependencies": {
-    "axios": "^1.18.1",
+    "bcryptjs": "^3.0.3",
     "cheerio": "^1.2.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "mammoth": "^1.12.0",
+    "multer": "^2.2.0",
     "node-cron": "^4.6.0",
-    "openai": "^6.48.0",
-    "sqlite3": "^6.0.1"
-  },
-  "optionalDependencies": {
-    "puppeteer": "^24.10.0"
-  },
-  "devDependencies": {
-    "playwright": "^1.61.1"
+    "openai": "^6.49.0",
+    "pdf-parse": "^2.4.5",
+    "pg": "^8.22.0",
+    "puppeteer": "^24.43.1"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   }
 }

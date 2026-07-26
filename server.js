@@ -2,8 +2,12 @@
  * Application entry point.
  *
  *  - serves the dashboard from /public
- *  - exposes the JSON API consumed by the dashboard
+ *  - exposes the JSON API it consumes
  *  - schedules the daily scrape (00:00 by default) with node-cron
+ *
+ * Everything under /api/resumes, /api/jobs, /api/scrape and /api/status sits
+ * behind `requireAuth`, so a request can only ever touch its own tenant's rows:
+ * handlers pass `req.user.id` into the database layer, which filters by it.
  *
  * dotenv is loaded first so that every module below sees the configuration.
  */
@@ -12,12 +16,17 @@ require('dotenv').config();
 
 const path = require('path');
 const express = require('express');
+const multer = require('multer');
 const cron = require('node-cron');
 
-const { getAllJobs, getStats, getLastRun, initDatabase, close: closeDatabase } = require('./services/database');
-const { runScraper, isRunning } = require('./services/scraper');
-const { MODEL, TARGET_ROLE, isLlmEnabled } = require('./services/matcher');
-const { getEnabledSources } = require('./config/sources');
+const db = require('./services/database');
+const auth = require('./services/auth');
+const { extractResumeText, detectResumeKind } = require('./services/parser');
+const { runScraper, runScraperForUser, isRunning, getLastRun } = require('./services/scraper');
+const { MODEL, isLlmEnabled } = require('./services/matcher');
+const { buildCandidateProfile } = require('./services/relevance');
+const { MIN_LPA_SALARY, MIN_LPA_CTC } = require('./services/compensation');
+const { getEnabledSources, getTrustedCompanies } = require('./config/sources');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -25,92 +34,259 @@ const CRON_SCHEDULE = process.env.CRON_SCHEDULE || '0 0 * * *'; // daily at midn
 const CRON_TIMEZONE = process.env.CRON_TIMEZONE || undefined;
 const RUN_ON_STARTUP = String(process.env.RUN_ON_STARTUP || 'false').toLowerCase() === 'true';
 
-app.use(express.json());
+const MAX_RESUME_BYTES = Number(process.env.MAX_RESUME_BYTES || 5 * 1024 * 1024);
+const MAX_RESUMES_PER_UPLOAD = Number(process.env.MAX_RESUMES_PER_UPLOAD || 10);
+
+app.use(express.json({ limit: '1mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
+/**
+ * Uploads stay in memory: the buffer goes straight to the PDF/DOCX extractor
+ * and only the extracted text is persisted. Nothing is written to disk, which
+ * is what makes the app safe on Render's ephemeral filesystem.
+ */
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_RESUME_BYTES, files: MAX_RESUMES_PER_UPLOAD },
+  fileFilter(req, file, callback) {
+    if (detectResumeKind(file.originalname, file.mimetype)) return callback(null, true);
+    callback(new Error(`"${file.originalname}" is not a PDF, DOCX or TXT file.`));
+  },
+});
+
+/**
+ * Wraps an async handler so a rejected promise reaches the error middleware
+ * instead of hanging the request.
+ *
+ * @param {Function} handler
+ * @returns {import('express').RequestHandler}
+ */
+const asyncRoute = (handler) => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
+
 /* ------------------------------------------------------------------ */
-/* API                                                                 */
+/* Auth                                                                */
+/* ------------------------------------------------------------------ */
+
+/** POST /api/auth/register - create an account and return a JWT. */
+app.post(
+  '/api/auth/register',
+  asyncRoute(async (req, res) => {
+    const { username, password } = req.body || {};
+    const result = await auth.register(String(username || '').trim(), String(password || ''));
+    res.status(201).json(result);
+  })
+);
+
+/** POST /api/auth/login - exchange credentials for a JWT. */
+app.post(
+  '/api/auth/login',
+  asyncRoute(async (req, res) => {
+    const { username, password } = req.body || {};
+    const result = await auth.login(String(username || '').trim(), String(password || ''));
+    res.json(result);
+  })
+);
+
+/** GET /api/auth/me - who the current token belongs to. */
+app.get('/api/auth/me', auth.requireAuth, (req, res) => res.json({ user: req.user }));
+
+/* ------------------------------------------------------------------ */
+/* Resumes (protected)                                                 */
+/* ------------------------------------------------------------------ */
+
+/** GET /api/resumes - this user's resumes (metadata only). */
+app.get(
+  '/api/resumes',
+  auth.requireAuth,
+  asyncRoute(async (req, res) => {
+    res.json(await db.getResumeSummaries(req.user.id));
+  })
+);
+
+/**
+ * POST /api/resumes - multipart upload of one or more resumes.
+ *
+ * Each file is parsed in memory; a file that cannot be read is reported in
+ * `failed` while the readable ones are still saved, so one bad scan does not
+ * lose the rest of the batch.
+ */
+app.post(
+  '/api/resumes',
+  auth.requireAuth,
+  upload.array('resumes', MAX_RESUMES_PER_UPLOAD),
+  asyncRoute(async (req, res) => {
+    const files = req.files || [];
+    if (!files.length) return res.status(400).json({ error: 'No files were uploaded.' });
+
+    const saved = [];
+    const failed = [];
+
+    for (const file of files) {
+      try {
+        const parsed = await extractResumeText(file.buffer, file.originalname, file.mimetype);
+        const row = await db.addResume(req.user.id, parsed.filename, parsed.text);
+        saved.push({ ...row, kind: parsed.kind });
+      } catch (error) {
+        failed.push({ filename: file.originalname, error: error.message });
+      }
+    }
+
+    res.status(saved.length ? 201 : 400).json({ saved, failed });
+  })
+);
+
+/**
+ * GET /api/resumes/profile - the seniority/role profile derived from this
+ * user's resumes.
+ *
+ * The board silently drops postings that fail the relevance gate, so the
+ * dashboard shows what the gate believes about the candidate. If it reads
+ * someone as entry-level when they are senior, that is the number to look at.
+ */
+app.get(
+  '/api/resumes/profile',
+  auth.requireAuth,
+  asyncRoute(async (req, res) => {
+    const resumes = await db.getResumes(req.user.id);
+    const profile = buildCandidateProfile(resumes);
+    res.json({
+      level: profile.level,
+      levelLabel: profile.levelLabel,
+      years: profile.years,
+      families: profile.families,
+      skills: profile.skills,
+      location: profile.location,
+      resumeCount: resumes.length,
+    });
+  })
+);
+
+/** DELETE /api/resumes/:id - remove one of this user's resumes. */
+app.delete(
+  '/api/resumes/:id',
+  auth.requireAuth,
+  asyncRoute(async (req, res) => {
+    const removed = await db.deleteResume(req.user.id, Number(req.params.id));
+    if (!removed) return res.status(404).json({ error: 'Resume not found.' });
+    res.json({ ok: true });
+  })
+);
+
+/* ------------------------------------------------------------------ */
+/* Jobs (protected)                                                    */
 /* ------------------------------------------------------------------ */
 
 /**
  * GET /api/jobs
- * Query params: `minScore` (number), `q` (title/company search), `limit` (number).
- * Rows come back sorted by match score, highest first.
+ * Query params: `jobType` ("Internship" | "Full-Time Job"), `minScore`, `q`,
+ * `limit`, `includeBelowBar` (postings under the pay bar are hidden by default).
+ * Rows come back best match first.
  */
-app.get('/api/jobs', async (req, res) => {
-  try {
+app.get(
+  '/api/jobs',
+  auth.requireAuth,
+  asyncRoute(async (req, res) => {
     const minScore = Number(req.query.minScore);
     const limit = Number(req.query.limit);
 
-    const jobs = await getAllJobs({
+    const jobs = await db.getJobs(req.user.id, {
+      jobType: req.query.jobType ? String(req.query.jobType) : undefined,
       minScore: Number.isFinite(minScore) ? minScore : undefined,
       search: req.query.q ? String(req.query.q) : undefined,
       limit: Number.isFinite(limit) ? limit : undefined,
+      includeBelowBar: String(req.query.includeBelowBar || '').toLowerCase() === 'true',
+      includeMismatch: String(req.query.includeMismatch || '').toLowerCase() === 'true',
     });
 
     res.json(jobs);
-  } catch (error) {
-    console.error('[api] /api/jobs failed:', error.message);
-    res.status(500).json({ error: 'Failed to retrieve jobs from the database.' });
-  }
-});
+  })
+);
 
-/** GET /api/stats - aggregate counters for the dashboard header. */
-app.get('/api/stats', async (req, res) => {
-  try {
-    res.json(await getStats());
-  } catch (error) {
-    console.error('[api] /api/stats failed:', error.message);
-    res.status(500).json({ error: 'Failed to compute statistics.' });
-  }
-});
+/** GET /api/jobs/stats - counters for the dashboard header. */
+app.get(
+  '/api/jobs/stats',
+  auth.requireAuth,
+  asyncRoute(async (req, res) => {
+    res.json(await db.getStats(req.user.id));
+  })
+);
 
-/** GET /api/status - scraper/scheduler state plus the last run summary. */
-app.get('/api/status', async (req, res) => {
-  try {
+/** DELETE /api/jobs/:id - drop one posting from this user's board. */
+app.delete(
+  '/api/jobs/:id',
+  auth.requireAuth,
+  asyncRoute(async (req, res) => {
+    const removed = await db.deleteJob(req.user.id, Number(req.params.id));
+    if (!removed) return res.status(404).json({ error: 'Job not found.' });
+    res.json({ ok: true });
+  })
+);
+
+/** DELETE /api/jobs - clear this user's board. */
+app.delete(
+  '/api/jobs',
+  auth.requireAuth,
+  asyncRoute(async (req, res) => {
+    res.json({ removed: await db.deleteAllJobs(req.user.id) });
+  })
+);
+
+/* ------------------------------------------------------------------ */
+/* Scraping (protected)                                                */
+/* ------------------------------------------------------------------ */
+
+/** POST /api/scrape - run the pipeline now for the calling user. */
+app.post(
+  '/api/scrape',
+  auth.requireAuth,
+  asyncRoute(async (req, res) => {
+    if (isRunning()) return res.status(409).json({ error: 'A scrape is already running.' });
+    res.json(await runScraperForUser(req.user.id));
+  })
+);
+
+/** GET /api/status - scheduler state, configured sources and the last run. */
+app.get(
+  '/api/status',
+  auth.requireAuth,
+  asyncRoute(async (req, res) => {
     res.json({
       running: isRunning(),
       cronSchedule: CRON_SCHEDULE,
       timezone: CRON_TIMEZONE || Intl.DateTimeFormat().resolvedOptions().timeZone,
-      matcher: { model: MODEL, targetRole: TARGET_ROLE, llmEnabled: isLlmEnabled() },
-      sources: getEnabledSources().map((s) => ({ id: s.id, name: s.name, mode: s.mode })),
-      lastRun: await getLastRun(),
+      matcher: { model: MODEL, llmEnabled: isLlmEnabled() },
+      payBar: { salaryLpa: MIN_LPA_SALARY, ctcLpa: MIN_LPA_CTC },
+      sources: getEnabledSources().map((source) => ({ id: source.id, name: source.name, company: source.company })),
+      trustedCompanies: getTrustedCompanies(),
+      lastRun: getLastRun(),
     });
-  } catch (error) {
-    console.error('[api] /api/status failed:', error.message);
-    res.status(500).json({ error: 'Failed to read scraper status.' });
-  }
-});
+  })
+);
 
-/**
- * POST /api/scrape - triggers a scrape immediately instead of waiting for cron.
- * Returns 409 while another run is in flight.
- */
-app.post('/api/scrape', async (req, res) => {
-  if (isRunning()) {
-    return res.status(409).json({ error: 'A scrape is already running.' });
-  }
-
-  try {
-    const summary = await runScraper({ trigger: 'manual' });
-    res.json(summary);
-  } catch (error) {
-    console.error('[api] /api/scrape failed:', error.message);
-    res.status(500).json({ error: 'Scrape failed.', detail: error.message });
-  }
-});
-
-/** GET /api/health - liveness probe. */
+/** GET /api/health - liveness probe (public, used by Render). */
 app.get('/api/health', (req, res) => res.json({ ok: true, uptime: process.uptime() }));
 
 /** Unknown API routes get JSON, not the SPA shell. */
 app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
 
-/** Last-resort error handler so a thrown error never kills the process. */
+/**
+ * Central error handler. Errors carrying a `.status` (thrown by the auth
+ * service) keep it; multer's upload limits are translated into 400/413.
+ */
 app.use((error, req, res, next) => {
-  console.error('[api] Unhandled error:', error.message);
   if (res.headersSent) return next(error);
-  res.status(500).json({ error: 'Internal server error.' });
+
+  if (error instanceof multer.MulterError) {
+    const tooBig = error.code === 'LIMIT_FILE_SIZE';
+    return res.status(tooBig ? 413 : 400).json({
+      error: tooBig ? `Each resume must be under ${Math.round(MAX_RESUME_BYTES / 1024 / 1024)} MB.` : error.message,
+    });
+  }
+
+  const status = Number(error.status) || 500;
+  if (status >= 500) console.error('[api] Unhandled error:', error);
+
+  res.status(status).json({ error: status >= 500 ? 'Internal server error.' : error.message });
 });
 
 /* ------------------------------------------------------------------ */
@@ -122,7 +298,11 @@ app.use((error, req, res, next) => {
  * @returns {Promise<void>}
  */
 async function start() {
-  await initDatabase();
+  if (!auth.isConfigured()) {
+    throw new Error('JWT_SECRET must be set to a random string of at least 16 characters.');
+  }
+
+  await db.initDatabase();
 
   const server = app.listen(PORT, () => {
     console.log(`[server] Dashboard ready at http://localhost:${PORT}`);
@@ -134,7 +314,7 @@ async function start() {
     task = cron.schedule(
       CRON_SCHEDULE,
       async () => {
-        console.log('[cron] Running scheduled job scrape...');
+        console.log('[cron] Running scheduled scrape for all users...');
         try {
           await runScraper({ trigger: 'cron' });
         } catch (error) {
@@ -143,7 +323,7 @@ async function start() {
       },
       CRON_TIMEZONE ? { timezone: CRON_TIMEZONE } : undefined
     );
-    console.log(`[cron] Daily scrape scheduled with "${CRON_SCHEDULE}".`);
+    console.log(`[cron] Scrape scheduled with "${CRON_SCHEDULE}" (${CRON_TIMEZONE || 'server time'}).`);
   } else {
     console.error(`[cron] Invalid CRON_SCHEDULE "${CRON_SCHEDULE}" - the scheduler is disabled.`);
   }
@@ -153,13 +333,13 @@ async function start() {
     runScraper({ trigger: 'startup' }).catch((error) => console.error('[server] Startup scrape failed:', error.message));
   }
 
-  /** Closes the scheduler, HTTP server and database on SIGINT/SIGTERM. */
+  /** Closes the scheduler, HTTP server and pool on SIGINT/SIGTERM. */
   const shutdown = async (signal) => {
     console.log(`\n[server] ${signal} received - shutting down.`);
     try {
       if (task) await task.stop();
       server.close();
-      await closeDatabase();
+      await db.close();
     } finally {
       process.exit(0);
     }
@@ -174,7 +354,7 @@ process.on('unhandledRejection', (reason) => console.error('[server] Unhandled r
 
 if (require.main === module) {
   start().catch((error) => {
-    console.error('[server] Failed to start:', error);
+    console.error('[server] Failed to start:', error.message);
     process.exit(1);
   });
 }

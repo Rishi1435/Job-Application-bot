@@ -1,350 +1,508 @@
 /**
- * SQLite persistence layer.
+ * PostgreSQL persistence layer (multi-tenant).
  *
- * Responsibilities:
- *  - own the schema (and migrate older databases forward in place)
- *  - de-duplicate postings on their apply URL while still tracking "seen again"
- *  - expose a small promise-based API to the rest of the app
+ * Every row in `resumes` and `jobs` belongs to exactly one user, and *every*
+ * query in this file filters by `user_id`. That is the only tenancy boundary in
+ * the app, so it is enforced here rather than in the route handlers: a route
+ * cannot accidentally read another tenant's data because no function exposed
+ * below will run without a user id.
  *
- * The sqlite3 driver is callback based, so every query is wrapped in a promise
- * helper below. No other module should touch `db` directly.
+ * All statements are parameterised ($1, $2, ...) - no string interpolation of
+ * user input anywhere.
  */
 
-const sqlite3 = require('sqlite3').verbose();
-const path = require('path');
+const { Pool } = require('pg');
 
-const DB_PATH = process.env.DB_PATH
-  ? path.resolve(process.cwd(), process.env.DB_PATH)
-  : path.resolve(__dirname, '../jobs.sqlite');
+const CONNECTION_STRING = process.env.DATABASE_URL || process.env.POSTGRES_URL || '';
 
-const db = new sqlite3.Database(DB_PATH, (err) => {
-  if (err) {
-    console.error('[db] Failed to open database:', err.message);
-  } else {
-    console.log(`[db] Connected to SQLite at ${DB_PATH}`);
-  }
+/**
+ * Render's managed Postgres terminates TLS with a certificate the Node client
+ * does not trust out of the box, so external connections need
+ * `rejectUnauthorized: false`. Internal connections (and local Docker) do not
+ * use TLS at all. Force either way with DATABASE_SSL=true|false.
+ *
+ * @returns {false|{rejectUnauthorized:boolean}}
+ */
+function resolveSsl() {
+  const explicit = String(process.env.DATABASE_SSL || '').toLowerCase();
+  if (explicit === 'true') return { rejectUnauthorized: false };
+  if (explicit === 'false') return false;
+
+  if (/sslmode=disable/i.test(CONNECTION_STRING)) return false;
+  if (/localhost|127\.0\.0\.1|\.internal|host\.docker\.internal/i.test(CONNECTION_STRING)) return false;
+  return CONNECTION_STRING ? { rejectUnauthorized: false } : false;
+}
+
+const pool = new Pool({
+  connectionString: CONNECTION_STRING,
+  ssl: resolveSsl(),
+  max: Number(process.env.PG_POOL_MAX || 10),
+  idleTimeoutMillis: Number(process.env.PG_IDLE_TIMEOUT_MS || 30000),
+  connectionTimeoutMillis: Number(process.env.PG_CONNECT_TIMEOUT_MS || 10000),
 });
 
-/* ------------------------------------------------------------------ */
-/* Promise helpers                                                     */
-/* ------------------------------------------------------------------ */
+// A dropped backend connection must never take the process down with it.
+pool.on('error', (error) => console.error('[db] Idle client error:', error.message));
 
 /**
- * Runs a statement that does not return rows.
- * @param {string} sql
+ * Runs a parameterised statement.
+ *
+ * @param {string} text SQL with $1-style placeholders
  * @param {Array<any>} [params]
- * @returns {Promise<{lastID:number, changes:number}>}
+ * @returns {Promise<import('pg').QueryResult>}
  */
-function run(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.run(sql, params, function onDone(err) {
-      if (err) reject(err);
-      else resolve({ lastID: this.lastID, changes: this.changes });
-    });
-  });
-}
-
-/**
- * Runs a query returning many rows.
- * @param {string} sql
- * @param {Array<any>} [params]
- * @returns {Promise<Array<object>>}
- */
-function all(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.all(sql, params, (err, rows) => (err ? reject(err) : resolve(rows)));
-  });
-}
-
-/**
- * Runs a query returning at most one row.
- * @param {string} sql
- * @param {Array<any>} [params]
- * @returns {Promise<object|undefined>}
- */
-function get(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.get(sql, params, (err, row) => (err ? reject(err) : resolve(row)));
-  });
+function query(text, params = []) {
+  return pool.query(text, params);
 }
 
 /* ------------------------------------------------------------------ */
 /* Schema                                                              */
 /* ------------------------------------------------------------------ */
 
-const JOBS_SCHEMA = `
-  CREATE TABLE IF NOT EXISTS jobs (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    title       TEXT NOT NULL,
-    company     TEXT,
-    description TEXT,
-    applyUrl    TEXT UNIQUE NOT NULL,
-    datePosted  TEXT,
-    score       INTEGER,
-    reason      TEXT,
-    sourceId    TEXT,
-    sourceName  TEXT,
-    firstSeenAt TEXT,
-    lastSeenAt  TEXT,
-    timesSeen   INTEGER DEFAULT 1
-  )
-`;
+const SCHEMA = [
+  `CREATE TABLE IF NOT EXISTS users (
+     id            SERIAL PRIMARY KEY,
+     username      VARCHAR(64)  NOT NULL UNIQUE,
+     password_hash VARCHAR(255) NOT NULL,
+     created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+   )`,
 
-const RUNS_SCHEMA = `
-  CREATE TABLE IF NOT EXISTS scrape_runs (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    startedAt   TEXT NOT NULL,
-    finishedAt  TEXT,
-    trigger     TEXT,
-    status      TEXT,
-    found       INTEGER DEFAULT 0,
-    inserted    INTEGER DEFAULT 0,
-    duplicates  INTEGER DEFAULT 0,
-    scored      INTEGER DEFAULT 0,
-    errors      TEXT
-  )
-`;
+  `CREATE TABLE IF NOT EXISTS resumes (
+     id         SERIAL PRIMARY KEY,
+     user_id    INTEGER      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+     filename   VARCHAR(255) NOT NULL,
+     content    TEXT         NOT NULL,
+     created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+   )`,
 
-/** Columns added after the first release; applied to pre-existing databases. */
-const MIGRATIONS = [
-  { column: 'sourceId', ddl: 'ALTER TABLE jobs ADD COLUMN sourceId TEXT' },
-  { column: 'sourceName', ddl: 'ALTER TABLE jobs ADD COLUMN sourceName TEXT' },
-  { column: 'firstSeenAt', ddl: 'ALTER TABLE jobs ADD COLUMN firstSeenAt TEXT' },
-  { column: 'lastSeenAt', ddl: 'ALTER TABLE jobs ADD COLUMN lastSeenAt TEXT' },
-  { column: 'timesSeen', ddl: 'ALTER TABLE jobs ADD COLUMN timesSeen INTEGER DEFAULT 1' },
+  `CREATE TABLE IF NOT EXISTS jobs (
+     id          SERIAL PRIMARY KEY,
+     user_id     INTEGER       NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+     title       VARCHAR(512)  NOT NULL,
+     company     VARCHAR(255),
+     description TEXT,
+     apply_url   VARCHAR(1024) NOT NULL,
+     location    VARCHAR(255),
+     match_data  JSONB,
+     source_id   VARCHAR(128),
+     date_posted VARCHAR(64),
+     created_at  TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+     updated_at  TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+   )`,
+
+  // Older databases created before match_data / bookkeeping columns existed.
+  `ALTER TABLE jobs ADD COLUMN IF NOT EXISTS match_data JSONB`,
+  `ALTER TABLE jobs ADD COLUMN IF NOT EXISTS source_id VARCHAR(128)`,
+  `ALTER TABLE jobs ADD COLUMN IF NOT EXISTS date_posted VARCHAR(64)`,
+  // The office the posting names. Needed as a column, not just inside
+  // match_data, so `scripts/rescreen.js` can re-run the location gate without
+  // re-scraping the board.
+  `ALTER TABLE jobs ADD COLUMN IF NOT EXISTS location VARCHAR(255)`,
+  `ALTER TABLE jobs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`,
+
+  // One copy of a posting per tenant; re-scraping updates instead of inserting.
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_user_apply_url ON jobs (user_id, apply_url)`,
+  `CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs (user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_resumes_user ON resumes (user_id)`,
+  // Keeps the "Internships" / "Full-Time" tab queries off a sequential scan.
+  `CREATE INDEX IF NOT EXISTS idx_jobs_match_data ON jobs USING GIN (match_data)`,
 ];
 
 /**
- * Creates tables/indexes when missing and adds any columns introduced later.
- * Safe to call repeatedly; awaited once at startup by `server.js`.
+ * Creates tables, columns and indexes when missing. Safe to call repeatedly;
+ * awaited once at startup by `server.js` and by `scripts/scrape.js`.
  *
  * @returns {Promise<void>}
  */
 async function initDatabase() {
-  await run(JOBS_SCHEMA);
-  await run(RUNS_SCHEMA);
-
-  const columns = await all('PRAGMA table_info(jobs)');
-  const existing = new Set(columns.map((c) => c.name));
-
-  for (const migration of MIGRATIONS) {
-    if (!existing.has(migration.column)) {
-      await run(migration.ddl);
-      console.log(`[db] Migrated: added jobs.${migration.column}`);
-    }
+  if (!CONNECTION_STRING) {
+    throw new Error('DATABASE_URL is not set - point it at a PostgreSQL instance.');
   }
 
-  await run('CREATE INDEX IF NOT EXISTS idx_jobs_score ON jobs (score DESC)');
-  await run('CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_applyUrl ON jobs (applyUrl)');
+  const client = await pool.connect();
+  try {
+    for (const statement of SCHEMA) {
+      await client.query(statement);
+    }
+    console.log('[db] PostgreSQL schema ready.');
+  } finally {
+    client.release();
+  }
 }
 
-/** Kicked off immediately so callers that forget to await `initDatabase` still work. */
-const ready = initDatabase().catch((err) => {
-  console.error('[db] Schema initialisation failed:', err.message);
-});
-
 /* ------------------------------------------------------------------ */
-/* Job queries                                                         */
+/* Users                                                               */
 /* ------------------------------------------------------------------ */
 
 /**
- * Checks whether a posting has already been stored.
- * Used by the scraper to skip LLM scoring for jobs it has seen before.
+ * @param {string} username
+ * @param {string} passwordHash bcrypt hash - never a plaintext password
+ * @returns {Promise<{id:number, username:string, created_at:Date}>}
+ */
+async function createUser(username, passwordHash) {
+  const { rows } = await query(
+    `INSERT INTO users (username, password_hash)
+     VALUES ($1, $2)
+     RETURNING id, username, created_at`,
+    [username, passwordHash]
+  );
+  return rows[0];
+}
+
+/**
+ * @param {string} username
+ * @returns {Promise<{id:number, username:string, password_hash:string}|null>}
+ */
+async function findUserByUsername(username) {
+  const { rows } = await query(
+    'SELECT id, username, password_hash, created_at FROM users WHERE LOWER(username) = LOWER($1)',
+    [username]
+  );
+  return rows[0] || null;
+}
+
+/**
+ * @param {number} id
+ * @returns {Promise<{id:number, username:string}|null>}
+ */
+async function findUserById(id) {
+  const { rows } = await query('SELECT id, username, created_at FROM users WHERE id = $1', [id]);
+  return rows[0] || null;
+}
+
+/**
+ * Every user id in the system - used by the scheduled scrape, which matches
+ * each freshly scraped posting against every tenant's resumes.
  *
- * @param {string} applyUrl canonical apply link
+ * @returns {Promise<Array<{id:number, username:string}>>}
+ */
+async function listUsers() {
+  const { rows } = await query('SELECT id, username FROM users ORDER BY id');
+  return rows;
+}
+
+/* ------------------------------------------------------------------ */
+/* Resumes                                                             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Stores extracted resume text. Files themselves are never written to disk.
+ *
+ * @param {number} userId owner
+ * @param {string} filename original upload name
+ * @param {string} content extracted plain text
+ * @returns {Promise<{id:number, filename:string, created_at:Date}>}
+ */
+async function addResume(userId, filename, content) {
+  const { rows } = await query(
+    `INSERT INTO resumes (user_id, filename, content)
+     VALUES ($1, $2, $3)
+     RETURNING id, filename, created_at, LENGTH(content) AS characters`,
+    [userId, filename, content]
+  );
+  return rows[0];
+}
+
+/**
+ * Full resume records for one tenant, including text (the matcher needs it).
+ *
+ * @param {number} userId
+ * @returns {Promise<Array<{id:number, filename:string, content:string}>>}
+ */
+async function getResumes(userId) {
+  const { rows } = await query(
+    'SELECT id, filename, content, created_at FROM resumes WHERE user_id = $1 ORDER BY id',
+    [userId]
+  );
+  return rows;
+}
+
+/**
+ * Metadata only - what the dashboard lists (resume text can be megabytes).
+ *
+ * @param {number} userId
+ * @returns {Promise<Array<{id:number, filename:string, characters:number}>>}
+ */
+async function getResumeSummaries(userId) {
+  const { rows } = await query(
+    `SELECT id, filename, created_at, LENGTH(content) AS characters
+       FROM resumes
+      WHERE user_id = $1
+      ORDER BY id`,
+    [userId]
+  );
+  return rows;
+}
+
+/**
+ * @param {number} userId
+ * @param {number} resumeId
+ * @returns {Promise<object|null>}
+ */
+async function getResumeById(userId, resumeId) {
+  const { rows } = await query('SELECT id, filename, content FROM resumes WHERE user_id = $1 AND id = $2', [
+    userId,
+    resumeId,
+  ]);
+  return rows[0] || null;
+}
+
+/**
+ * @param {number} userId
+ * @param {number} resumeId
+ * @returns {Promise<boolean>} whether a row was removed
+ */
+async function deleteResume(userId, resumeId) {
+  const { rowCount } = await query('DELETE FROM resumes WHERE user_id = $1 AND id = $2', [userId, resumeId]);
+  return rowCount > 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Jobs                                                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Inserts a posting for one tenant, or refreshes the stored copy when that
+ * tenant has already seen the apply URL.
+ *
+ * @param {number} userId owner
+ * @param {{title:string, company?:string, description?:string, applyUrl:string, matchData?:object, sourceId?:string, datePosted?:string}} job
+ * @returns {Promise<{id:number, inserted:boolean}>}
+ */
+async function upsertJob(userId, job) {
+  const { rows } = await query(
+    `INSERT INTO jobs (user_id, title, company, description, apply_url, location, match_data, source_id, date_posted)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     ON CONFLICT (user_id, apply_url) DO UPDATE
+        SET title       = EXCLUDED.title,
+            company     = EXCLUDED.company,
+            description = COALESCE(EXCLUDED.description, jobs.description),
+            location    = COALESCE(EXCLUDED.location, jobs.location),
+            match_data  = COALESCE(EXCLUDED.match_data, jobs.match_data),
+            source_id   = COALESCE(EXCLUDED.source_id, jobs.source_id),
+            date_posted = COALESCE(EXCLUDED.date_posted, jobs.date_posted),
+            updated_at  = NOW()
+     RETURNING id, (xmax = 0) AS inserted`,
+    [
+      userId,
+      String(job.title).slice(0, 512),
+      job.company ? String(job.company).slice(0, 255) : null,
+      job.description || null,
+      String(job.applyUrl).slice(0, 1024),
+      job.location ? String(job.location).slice(0, 255) : null,
+      job.matchData ? JSON.stringify(job.matchData) : null,
+      job.sourceId || null,
+      job.datePosted || null,
+    ]
+  );
+  return { id: rows[0].id, inserted: rows[0].inserted };
+}
+
+/**
+ * Whether this tenant already stores a posting (used to skip re-scoring).
+ *
+ * @param {number} userId
+ * @param {string} applyUrl
  * @returns {Promise<boolean>}
  */
-async function jobExists(applyUrl) {
-  await ready;
-  const row = await get('SELECT 1 AS hit FROM jobs WHERE applyUrl = ?', [applyUrl]);
-  return Boolean(row);
+async function jobExists(userId, applyUrl) {
+  const { rows } = await query('SELECT 1 FROM jobs WHERE user_id = $1 AND apply_url = $2', [userId, applyUrl]);
+  return rows.length > 0;
 }
 
 /**
- * Inserts a job, or records another sighting when the apply URL already exists.
+ * Writes the LLM verdict into the JSONB column.
  *
- * @param {object} job normalised job record
- * @returns {Promise<{status:'inserted'|'duplicate', id?:number}>}
+ * @param {number} userId
+ * @param {number} jobId
+ * @param {object} matchData `{job_type, best_resume_id, best_resume_name, score, reason}`
+ * @returns {Promise<boolean>}
  */
-async function insertJob(job) {
-  await ready;
-  const now = new Date().toISOString();
-
-  const existing = await get('SELECT id FROM jobs WHERE applyUrl = ?', [job.applyUrl]);
-  if (existing) {
-    await run('UPDATE jobs SET lastSeenAt = ?, timesSeen = COALESCE(timesSeen, 1) + 1 WHERE id = ?', [
-      now,
-      existing.id,
-    ]);
-    return { status: 'duplicate', id: existing.id };
-  }
-
-  const sql = `
-    INSERT INTO jobs
-      (title, company, description, applyUrl, datePosted, score, reason,
-       sourceId, sourceName, firstSeenAt, lastSeenAt, timesSeen)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-  `;
-
-  try {
-    const result = await run(sql, [
-      job.title,
-      job.company || null,
-      job.description || null,
-      job.applyUrl,
-      job.datePosted || null,
-      Number.isFinite(job.score) ? job.score : null,
-      job.reason || null,
-      job.sourceId || null,
-      job.sourceName || null,
-      now,
-      now,
-    ]);
-    return { status: 'inserted', id: result.lastID };
-  } catch (error) {
-    // A concurrent run can win the race between the SELECT and the INSERT.
-    if (String(error.message).includes('UNIQUE constraint failed')) {
-      return { status: 'duplicate' };
-    }
-    throw error;
-  }
+async function updateJobMatchData(userId, jobId, matchData) {
+  const { rowCount } = await query(
+    'UPDATE jobs SET match_data = $3, updated_at = NOW() WHERE user_id = $1 AND id = $2',
+    [userId, jobId, JSON.stringify(matchData)]
+  );
+  return rowCount > 0;
 }
 
 /**
- * Fetches stored jobs, highest match score first.
+ * Tenant-scoped job listing, best match first.
  *
- * @param {{minScore?:number, search?:string, limit?:number}} [options]
+ * Postings that fail the compensation bar are stored but excluded by default -
+ * they are still there for auditing (and survive a change of thresholds without
+ * a re-scrape), they are simply not recommended. Pass `includeBelowBar` to see
+ * them. `IS NOT FALSE` keeps rows saved before the bar existed, whose
+ * `meets_pay_bar` key is absent rather than false.
+ *
+ * Postings the relevance gate rejected (wrong field, or several levels above the
+ * candidate) are hidden the same way and for the same reason: kept for auditing,
+ * excluded from the board unless `includeMismatch` is passed.
+ *
+ * @param {number} userId
+ * @param {{jobType?:string, minScore?:number, search?:string, limit?:number, includeBelowBar?:boolean, includeMismatch?:boolean}} [options]
  * @returns {Promise<Array<object>>}
  */
-async function getAllJobs(options = {}) {
-  await ready;
-  const clauses = [];
-  const params = [];
+async function getJobs(userId, options = {}) {
+  const params = [userId];
+  const clauses = ['user_id = $1'];
+
+  if (!options.includeBelowBar) {
+    clauses.push(`(match_data->>'meets_pay_bar')::boolean IS NOT FALSE`);
+  }
+
+  if (!options.includeMismatch) {
+    // `NOT IN` rather than `= 'match'` so rows stored before the gate existed,
+    // whose `relevance` key is absent, keep showing.
+    clauses.push(`COALESCE(match_data->'relevance'->>'fit', 'match') NOT IN ('mismatch', 'overreach', 'elsewhere')`);
+  }
+
+  if (options.jobType) {
+    params.push(options.jobType);
+    clauses.push(`match_data->>'job_type' = $${params.length}`);
+  }
 
   if (Number.isFinite(options.minScore)) {
-    clauses.push('COALESCE(score, 0) >= ?');
     params.push(options.minScore);
+    clauses.push(`COALESCE((match_data->>'score')::numeric, 0) >= $${params.length}`);
   }
 
   if (options.search) {
-    clauses.push('(LOWER(title) LIKE ? OR LOWER(company) LIKE ?)');
-    const needle = `%${String(options.search).toLowerCase()}%`;
-    params.push(needle, needle);
+    params.push(`%${String(options.search).toLowerCase()}%`);
+    clauses.push(`(LOWER(title) LIKE $${params.length} OR LOWER(COALESCE(company, '')) LIKE $${params.length})`);
   }
 
-  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   let sql = `
-    SELECT id, title, company, description, applyUrl, datePosted, score, reason,
-           sourceId, sourceName, firstSeenAt, lastSeenAt, timesSeen
-    FROM jobs
-    ${where}
-    ORDER BY COALESCE(score, -1) DESC, COALESCE(datePosted, firstSeenAt) DESC
-  `;
+    SELECT id, title, company, description, apply_url, location, match_data, source_id, date_posted, created_at, updated_at
+      FROM jobs
+     WHERE ${clauses.join(' AND ')}
+     ORDER BY COALESCE((match_data->>'score')::numeric, -1) DESC, created_at DESC`;
 
   if (Number.isFinite(options.limit)) {
-    sql += ' LIMIT ?';
     params.push(options.limit);
+    sql += ` LIMIT $${params.length}`;
   }
 
-  return all(sql, params);
+  const { rows } = await query(sql, params);
+  return rows;
 }
 
 /**
- * Aggregate counters for the dashboard header.
- * @returns {Promise<{total:number, strongMatches:number, averageScore:number|null, lastSeenAt:string|null}>}
+ * Postings this tenant has stored but never scored (e.g. saved during an LLM
+ * outage). `scripts/scrape.js --rescore` feeds these back through the matcher.
+ *
+ * @param {number} userId
+ * @param {number} [limit]
+ * @returns {Promise<Array<object>>}
  */
-async function getStats() {
-  await ready;
-  const row = await get(`
-    SELECT COUNT(*)                                        AS total,
-           SUM(CASE WHEN score >= 70 THEN 1 ELSE 0 END)    AS strongMatches,
-           ROUND(AVG(score), 1)                            AS averageScore,
-           MAX(lastSeenAt)                                 AS lastSeenAt
-    FROM jobs
-  `);
+async function getUnmatchedJobs(userId, limit = 50) {
+  const { rows } = await query(
+    `SELECT id, title, company, description, apply_url
+       FROM jobs
+      WHERE user_id = $1 AND (match_data IS NULL OR match_data->>'score' IS NULL)
+      ORDER BY created_at DESC
+      LIMIT $2`,
+    [userId, limit]
+  );
+  return rows;
+}
+
+/**
+ * Header counters for the dashboard, scoped to one tenant.
+ *
+ * Counts describe the *recommended* board (pay bar applied); `belowPayBar`
+ * reports how many postings the bar is holding back.
+ *
+ * @param {number} userId
+ * @returns {Promise<{total:number, internships:number, fullTime:number, strongMatches:number, averageScore:number|null, belowPayBar:number, lastUpdatedAt:string|null}>}
+ */
+async function getStats(userId) {
+  const { rows } = await query(
+    `WITH recommended AS (
+       SELECT * FROM jobs
+        WHERE user_id = $1
+          AND (match_data->>'meets_pay_bar')::boolean IS NOT FALSE
+          AND COALESCE(match_data->'relevance'->>'fit', 'match') NOT IN ('mismatch', 'overreach', 'elsewhere')
+     )
+     SELECT (SELECT COUNT(*) FROM recommended)::int                                                     AS total,
+            (SELECT COUNT(*) FROM recommended WHERE match_data->>'job_type' = 'Internship')::int        AS internships,
+            (SELECT COUNT(*) FROM recommended WHERE match_data->>'job_type' = 'Full-Time Job')::int     AS full_time,
+            (SELECT COUNT(*) FROM recommended WHERE (match_data->>'score')::numeric >= 70)::int         AS strong_matches,
+            (SELECT ROUND(AVG((match_data->>'score')::numeric), 1) FROM recommended)                    AS average_score,
+            (SELECT COUNT(*) FROM jobs
+              WHERE user_id = $1 AND (match_data->>'meets_pay_bar')::boolean IS FALSE)::int             AS below_pay_bar,
+            (SELECT COUNT(*) FROM jobs
+              WHERE user_id = $1
+                AND match_data->'relevance'->>'fit' IN ('mismatch', 'overreach', 'elsewhere'))::int                  AS filtered_out,
+            (SELECT MAX(updated_at) FROM jobs WHERE user_id = $1)                                       AS last_updated_at`,
+    [userId]
+  );
+
+  const row = rows[0] || {};
   return {
-    total: row?.total || 0,
-    strongMatches: row?.strongMatches || 0,
-    averageScore: row?.averageScore ?? null,
-    lastSeenAt: row?.lastSeenAt || null,
+    total: row.total || 0,
+    internships: row.internships || 0,
+    fullTime: row.full_time || 0,
+    strongMatches: row.strong_matches || 0,
+    averageScore: row.average_score === null || row.average_score === undefined ? null : Number(row.average_score),
+    belowPayBar: row.below_pay_bar || 0,
+    filteredOut: row.filtered_out || 0,
+    lastUpdatedAt: row.last_updated_at || null,
   };
 }
 
-/* ------------------------------------------------------------------ */
-/* Scrape run bookkeeping                                              */
-/* ------------------------------------------------------------------ */
-
 /**
- * Opens a row in `scrape_runs` for the run that is starting.
- * @param {'cron'|'manual'|'startup'} trigger what kicked the run off
- * @returns {Promise<number>} run id
+ * @param {number} userId
+ * @param {number} jobId
+ * @returns {Promise<boolean>}
  */
-async function startRun(trigger) {
-  await ready;
-  const result = await run('INSERT INTO scrape_runs (startedAt, trigger, status) VALUES (?, ?, ?)', [
-    new Date().toISOString(),
-    trigger,
-    'running',
-  ]);
-  return result.lastID;
+async function deleteJob(userId, jobId) {
+  const { rowCount } = await query('DELETE FROM jobs WHERE user_id = $1 AND id = $2', [userId, jobId]);
+  return rowCount > 0;
 }
 
 /**
- * Closes out a run row with its final counters.
+ * Clears one tenant's board (used by the dashboard's "clear" action).
  *
- * @param {number} runId id returned by `startRun`
- * @param {{status:string, found?:number, inserted?:number, duplicates?:number, scored?:number, errors?:Array<string>}} summary
- * @returns {Promise<void>}
+ * @param {number} userId
+ * @returns {Promise<number>} rows removed
  */
-async function finishRun(runId, summary) {
-  await ready;
-  await run(
-    `UPDATE scrape_runs
-        SET finishedAt = ?, status = ?, found = ?, inserted = ?, duplicates = ?, scored = ?, errors = ?
-      WHERE id = ?`,
-    [
-      new Date().toISOString(),
-      summary.status,
-      summary.found || 0,
-      summary.inserted || 0,
-      summary.duplicates || 0,
-      summary.scored || 0,
-      summary.errors && summary.errors.length ? JSON.stringify(summary.errors) : null,
-      runId,
-    ]
-  );
+async function deleteAllJobs(userId) {
+  const { rowCount } = await query('DELETE FROM jobs WHERE user_id = $1', [userId]);
+  return rowCount;
 }
 
 /**
- * Returns the most recent finished-or-running scrape run, or null.
- * @returns {Promise<object|null>}
- */
-async function getLastRun() {
-  await ready;
-  const row = await get('SELECT * FROM scrape_runs ORDER BY id DESC LIMIT 1');
-  if (!row) return null;
-  return { ...row, errors: row.errors ? JSON.parse(row.errors) : [] };
-}
-
-/**
- * Closes the database handle (used on graceful shutdown).
+ * Closes the pool (graceful shutdown, and so test scripts can exit).
  * @returns {Promise<void>}
  */
-function close() {
-  return new Promise((resolve) => db.close(() => resolve()));
+async function close() {
+  await pool.end();
 }
 
 module.exports = {
-  db,
-  DB_PATH,
-  ready,
+  pool,
+  query,
   initDatabase,
+  // users
+  createUser,
+  findUserByUsername,
+  findUserById,
+  listUsers,
+  // resumes
+  addResume,
+  getResumes,
+  getResumeSummaries,
+  getResumeById,
+  deleteResume,
+  // jobs
+  upsertJob,
   jobExists,
-  insertJob,
-  getAllJobs,
+  updateJobMatchData,
+  getJobs,
+  getUnmatchedJobs,
   getStats,
-  startRun,
-  finishRun,
-  getLastRun,
+  deleteJob,
+  deleteAllJobs,
   close,
 };

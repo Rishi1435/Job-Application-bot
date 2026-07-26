@@ -3,87 +3,239 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Job Match Dashboard</title>
+    <title>Job Match</title>
     <link rel="stylesheet" href="style.css">
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎯</text></svg>">
 </head>
 <body>
-    <div class="container">
-        <header class="page-header">
-            <div>
-                <h1>Job Match Dashboard</h1>
-                <p class="subtitle" id="subtitle">Daily scraped postings, scored against your resume.</p>
+
+    <!-- Ambient background: two slow-drifting colour fields behind everything. -->
+    <div class="aurora" aria-hidden="true">
+        <span class="aurora-blob aurora-a"></span>
+        <span class="aurora-blob aurora-b"></span>
+        <span class="aurora-grid"></span>
+    </div>
+
+    <!--
+      Shown until init() decides between the auth screen and the dashboard.
+      Both of those start hidden, so without this the first paint of a returning
+      session is an empty page for as long as /api/auth/me takes.
+    -->
+    <section id="bootView" class="boot-view">
+        <span class="boot-spinner" aria-hidden="true"></span>
+        <p>Restoring your session&hellip;</p>
+    </section>
+
+    <!-- ============================================================= -->
+    <!-- Auth screen                                                    -->
+    <!-- ============================================================= -->
+    <section id="authView" class="auth-view" hidden>
+        <div class="auth-card" data-reveal>
+            <div class="auth-brand">
+                <span class="brand-mark">🎯</span>
+                <h1>Job Match</h1>
+                <p class="subtitle">Postings from trusted companies, screened against your resume and scored for how worth applying they are.</p>
             </div>
-            <div class="header-actions">
-                <button id="scrapeBtn" class="btn btn-ghost" title="Run the scraper now instead of waiting for the nightly cron">
-                    Run Scrape Now
+
+            <div class="segmented" role="tablist" id="authTabs">
+                <span class="segmented-thumb" id="authThumb" aria-hidden="true"></span>
+                <button class="segment is-active" data-auth-tab="login" role="tab" aria-selected="true" type="button">Sign in</button>
+                <button class="segment" data-auth-tab="register" role="tab" aria-selected="false" type="button">Create account</button>
+            </div>
+
+            <form id="authForm" autocomplete="on" novalidate>
+                <label class="field">
+                    <span class="field-label">Username</span>
+                    <input id="authUsername" class="input" type="text" name="username" autocomplete="username"
+                           placeholder="your-username or email" required minlength="3" maxlength="64">
+                </label>
+
+                <label class="field">
+                    <span class="field-label">Password</span>
+                    <input id="authPassword" class="input" type="password" name="password"
+                           autocomplete="current-password" placeholder="At least 8 characters" required minlength="8">
+                </label>
+
+                <p id="authError" class="form-error" role="alert" hidden></p>
+
+                <button id="authSubmit" class="btn btn-primary btn-block" type="submit" data-press>
+                    <span class="btn-label">Sign in</span>
                 </button>
-                <button id="exportBtn" class="btn btn-primary" title="Download the jobs currently shown in the table">
-                    Export to Excel
+            </form>
+
+            <p class="auth-hint" id="authHint">New here? Switch to <strong>Create account</strong> to get started.</p>
+        </div>
+    </section>
+
+    <!-- ============================================================= -->
+    <!-- Dashboard                                                      -->
+    <!-- ============================================================= -->
+    <div id="appView" class="app" hidden>
+
+        <header class="topbar">
+            <div class="topbar-brand">
+                <span class="brand-mark brand-mark-sm">🎯</span>
+                <div>
+                    <h1>Job Match</h1>
+                    <p class="subtitle" id="subtitle">Loading your board&hellip;</p>
+                </div>
+            </div>
+
+            <div class="topbar-actions">
+                <button id="themeBtn" class="btn btn-icon-only" type="button" title="Switch between light and dark" data-press aria-label="Toggle theme">
+                    <span id="themeIcon">🌙</span>
                 </button>
+                <button id="scrapeBtn" class="btn btn-ghost" type="button" title="Scrape the trusted career pages now" data-press>
+                    <span class="btn-spinner" aria-hidden="true"></span>
+                    <span class="btn-label">Run scrape</span>
+                </button>
+                <button id="exportBtn" class="btn btn-primary" type="button" title="Download the cards shown in the active tab" data-press>
+                    <span class="btn-label">Export</span>
+                </button>
+                <div class="user-menu">
+                    <span class="avatar" id="avatar" aria-hidden="true"></span>
+                    <span class="user-name" id="userChip"></span>
+                    <button id="logoutBtn" class="btn btn-quiet" type="button" title="Sign out" data-press>Sign out</button>
+                </div>
             </div>
         </header>
 
-        <!-- Aggregate counters -->
-        <section class="stats" id="stats">
-            <div class="stat-card">
-                <span class="stat-label">Jobs tracked</span>
-                <span class="stat-value" id="statTotal">-</span>
-            </div>
-            <div class="stat-card">
-                <span class="stat-label">Strong matches (70+)</span>
-                <span class="stat-value accent-good" id="statStrong">-</span>
-            </div>
-            <div class="stat-card">
-                <span class="stat-label">Average score</span>
-                <span class="stat-value" id="statAverage">-</span>
-            </div>
-            <div class="stat-card">
-                <span class="stat-label">Last scrape</span>
-                <span class="stat-value stat-value-sm" id="statLastRun">-</span>
-            </div>
-        </section>
+        <main class="container">
 
-        <!-- Filters -->
-        <section class="toolbar">
-            <input type="search" id="searchInput" class="input" placeholder="Filter by title or company..." autocomplete="off">
-            <label class="slider-label" for="minScore">
-                Min score
-                <input type="range" id="minScore" min="0" max="100" step="5" value="0">
-                <output id="minScoreValue">0</output>
-            </label>
-            <span class="result-count" id="resultCount"></span>
-        </section>
+            <!-- Candidate profile: what the relevance gate believes about you -->
+            <section class="profile-strip" id="profileStrip" data-reveal hidden>
+                <div class="profile-lead">
+                    <span class="profile-eyebrow">Screening as</span>
+                    <strong id="profileLevel">-</strong>
+                </div>
+                <div class="profile-chips" id="profileChips"></div>
+                <p class="profile-note" id="profileNote"></p>
+            </section>
 
-        <main>
-            <div class="table-wrap">
-                <table id="jobsTable">
-                    <thead>
-                        <tr>
-                            <th data-sort="title" class="sortable">Job Title</th>
-                            <th data-sort="company" class="sortable">Company</th>
-                            <th data-sort="score" class="sortable sorted-desc">Match Score (%)</th>
-                            <th data-sort="datePosted" class="sortable">Date</th>
-                            <th>Action</th>
-                        </tr>
-                    </thead>
-                    <tbody id="jobsTableBody">
-                        <tr><td colspan="5" class="empty">Loading jobs...</td></tr>
-                    </tbody>
-                </table>
-            </div>
+            <!-- Aggregate counters -->
+            <section class="stats" aria-label="Board summary">
+                <article class="stat-card" data-reveal>
+                    <span class="stat-label">Worth applying</span>
+                    <span class="stat-value" id="statTotal">0</span>
+                    <span class="stat-foot">after screening</span>
+                </article>
+                <article class="stat-card" data-reveal>
+                    <span class="stat-label">Internships</span>
+                    <span class="stat-value tone-info" id="statInternships">0</span>
+                    <span class="stat-foot">open now</span>
+                </article>
+                <article class="stat-card" data-reveal>
+                    <span class="stat-label">Full-time</span>
+                    <span class="stat-value tone-info" id="statFullTime">0</span>
+                    <span class="stat-foot">open now</span>
+                </article>
+                <article class="stat-card" data-reveal>
+                    <span class="stat-label">Strong matches</span>
+                    <span class="stat-value tone-good" id="statStrong">0</span>
+                    <span class="stat-foot">scoring 70+</span>
+                </article>
+                <article class="stat-card" data-reveal>
+                    <span class="stat-label">Average score</span>
+                    <span class="stat-value" id="statAverage">0</span>
+                    <span class="stat-foot">across the board</span>
+                </article>
+                <article class="stat-card" data-reveal title="Wrong field, too senior, or paying under the bar">
+                    <span class="stat-label">Filtered out</span>
+                    <span class="stat-value tone-muted" id="statFiltered">0</span>
+                    <span class="stat-foot">not shown</span>
+                </article>
+            </section>
+
+            <!-- Resumes -->
+            <section class="panel" data-reveal>
+                <div class="panel-head">
+                    <div>
+                        <h2>Your resumes</h2>
+                        <p class="panel-sub">Every posting is scored against these, and the best-fitting one is recommended per job.</p>
+                    </div>
+                    <span class="pill pill-quiet" id="resumeCount"></span>
+                </div>
+
+                <div class="upload-row">
+                    <label class="file-drop" id="fileDrop">
+                        <input type="file" id="resumeInput" accept=".pdf,.docx,.doc,.txt,application/pdf" multiple hidden>
+                        <span class="file-drop-icon" aria-hidden="true">📄</span>
+                        <span class="file-drop-title">Drop resumes here, or click to browse</span>
+                        <span class="file-drop-hint">PDF, DOCX or TXT &middot; up to 10 files &middot; 5&nbsp;MB each</span>
+                    </label>
+                    <button id="uploadBtn" class="btn btn-primary" type="button" disabled data-press>
+                        <span class="btn-label">Upload</span>
+                    </button>
+                </div>
+
+                <ul class="resume-list" id="resumeList"></ul>
+            </section>
+
+            <!-- Jobs -->
+            <section class="panel panel-board" data-reveal>
+                <div class="segmented segmented-lg" role="tablist" id="jobTabs">
+                    <span class="segmented-thumb" id="jobThumb" aria-hidden="true"></span>
+                    <button class="segment is-active" data-tab="Internship" role="tab" aria-selected="true" type="button">
+                        Internships <span class="count" id="tabCountInternship">0</span>
+                    </button>
+                    <button class="segment" data-tab="Full-Time Job" role="tab" aria-selected="false" type="button">
+                        Full-time <span class="count" id="tabCountFullTime">0</span>
+                    </button>
+                </div>
+
+                <div class="toolbar">
+                    <div class="search">
+                        <span class="search-icon" aria-hidden="true">🔍</span>
+                        <input type="search" id="searchInput" class="input input-search" placeholder="Filter by title or company&hellip;" autocomplete="off">
+                    </div>
+
+                    <label class="range-control" for="minScore">
+                        <span>Min score</span>
+                        <input type="range" id="minScore" min="0" max="100" step="5" value="0">
+                        <output id="minScoreValue">0</output>
+                    </label>
+
+                    <label class="select-control" for="sortSelect">
+                        <span>Sort</span>
+                        <select id="sortSelect" class="input input-select">
+                            <option value="score">Best match</option>
+                            <option value="pay">Highest pay</option>
+                            <option value="company">Company</option>
+                            <option value="title">Job title</option>
+                        </select>
+                    </label>
+
+                    <div class="switches">
+                        <label class="switch" for="includeMismatch" title="Roles in another field, or several levels above you">
+                            <input type="checkbox" id="includeMismatch">
+                            <span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span>
+                            <span class="switch-text">Show filtered-out</span>
+                        </label>
+                        <label class="switch" for="includeBelowBar" id="payBarLabel" title="Postings advertising pay under the bar">
+                            <input type="checkbox" id="includeBelowBar">
+                            <span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span>
+                            <span class="switch-text">Show low pay</span>
+                        </label>
+                    </div>
+
+                    <span class="result-count" id="resultCount"></span>
+                </div>
+
+                <div class="job-list" id="jobList" aria-live="polite"></div>
+            </section>
+
+            <footer class="page-footer">
+                <span id="footerStatus">Ready.</span>
+            </footer>
         </main>
-
-        <footer class="page-footer">
-            <span id="footerStatus">Ready.</span>
-        </footer>
     </div>
 
     <!-- Toast notifications -->
-    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <div id="toastStack" class="toast-stack" role="status" aria-live="polite"></div>
 
     <!-- SheetJS (xlsx) for the Excel export; script.js falls back to CSV if it fails to load. -->
     <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+    <script src="motion.js"></script>
     <script src="script.js"></script>
 </body>
 </html>
