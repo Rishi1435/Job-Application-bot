@@ -20,13 +20,19 @@ databases:
     user: jobbot
     plan: free
     postgresMajorVersion: "16"
+    # Must match the web service's region below. Render's internal hostname
+    # (`dpg-...-a`) only resolves inside one region, so a database in Oregon and
+    # a service in Singapore fail with `getaddrinfo ENOTFOUND` at boot - and
+    # neither resource can be moved afterwards, only recreated.
+    region: singapore
 
 services:
   - type: web
     name: job-application-bot
     runtime: docker
     plan: free
-    # Closest region to India; move it nearer to you if that is not where you are.
+    # Closest region to India; move it nearer to you if that is not where you
+    # are - and change the database's region to match, or the two cannot talk.
     region: singapore
     branch: main
     healthCheckPath: /api/health

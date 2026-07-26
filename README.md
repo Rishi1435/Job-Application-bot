@@ -389,6 +389,13 @@ is a single-label name (`dpg-...-a`) whose Postgres does not offer TLS, while th
 handled automatically; `DATABASE_SSL=true|false` overrides the guess if you ever
 need it.
 
+That internal name also only resolves **within one region**. A database and a
+service in different regions fail at boot with
+`getaddrinfo ENOTFOUND dpg-...-a`, and neither resource can be moved afterwards -
+the fix is to recreate one of them, or to switch `DATABASE_URL` to the external
+connection string, which is public and works from anywhere at the cost of
+crossing the internet on every query.
+
 ## Tests
 
 ```bash
