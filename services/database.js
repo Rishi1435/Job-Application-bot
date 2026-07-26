@@ -2,10 +2,16 @@
  * PostgreSQL persistence layer (multi-tenant).
  *
  * Every row in `resumes` and `jobs` belongs to exactly one user, and *every*
- * query in this file filters by `user_id`. That is the only tenancy boundary in
- * the app, so it is enforced here rather than in the route handlers: a route
- * cannot accidentally read another tenant's data because no function exposed
- * below will run without a user id.
+ * query touching those tables filters by `user_id`. That is the only tenancy
+ * boundary in the app, so it is enforced here rather than in the route
+ * handlers: a route cannot accidentally read another tenant's data because no
+ * function exposed below will run without a user id.
+ *
+ * `ats_boards` is the one deliberate exception. It holds career-page addresses
+ * the crawler discovered - public facts about employers, containing nothing a
+ * user typed or uploaded - and it is shared on purpose: a board found while
+ * scraping for one user is a board every user's run can then search. Nothing in
+ * it is served to the browser per tenant.
  *
  * All statements are parameterised ($1, $2, ...) - no string interpolation of
  * user input anywhere.
@@ -99,6 +105,26 @@ const SCHEMA = [
   // re-scraping the board.
   `ALTER TABLE jobs ADD COLUMN IF NOT EXISTS location VARCHAR(255)`,
   `ALTER TABLE jobs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`,
+
+  // Career pages the crawler has discovered. Shared across tenants by design -
+  // see the module header. `ok = false` marks a board whose API stopped
+  // answering, so a dead slug is remembered rather than retried every night.
+  `CREATE TABLE IF NOT EXISTS ats_boards (
+     id              SERIAL PRIMARY KEY,
+     platform        VARCHAR(32)  NOT NULL,
+     slug            VARCHAR(255) NOT NULL,
+     company         VARCHAR(255),
+     board_url       VARCHAR(512),
+     discovered_via  VARCHAR(64),
+     job_count       INTEGER      NOT NULL DEFAULT 0,
+     ok              BOOLEAN      NOT NULL DEFAULT TRUE,
+     last_scraped_at TIMESTAMPTZ,
+     created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+   )`,
+
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_ats_boards_platform_slug ON ats_boards (platform, LOWER(slug))`,
+  // The scrape queue is "healthy boards, least recently visited first".
+  `CREATE INDEX IF NOT EXISTS idx_ats_boards_queue ON ats_boards (ok, last_scraped_at NULLS FIRST)`,
 
   // One copy of a posting per tenant; re-scraping updates instead of inserting.
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_user_apply_url ON jobs (user_id, apply_url)`,
@@ -299,6 +325,62 @@ async function upsertJob(userId, job) {
 }
 
 /**
+ * Every apply URL these tenants have already stored.
+ *
+ * This is the deduplication set the crawler filters against *before* it opens
+ * detail pages or calls the LLM. Checking one URL at a time with `jobExists`
+ * would be a round trip per posting on a run that now discovers thousands, and
+ * it happened after the expensive work rather than before it.
+ *
+ * @param {Array<number>} userIds tenants the run is storing for
+ * @returns {Promise<Set<string>>}
+ */
+async function getKnownApplyUrls(userIds = []) {
+  if (!userIds.length) return new Set();
+  const { rows } = await query('SELECT DISTINCT apply_url FROM jobs WHERE user_id = ANY($1::int[])', [userIds]);
+  return new Set(rows.map((row) => row.apply_url));
+}
+
+/**
+ * Apply URLs that *every* tenant in the run already stores.
+ *
+ * The crawl is shared, so a posting can only be dropped before scoring when it
+ * would be a duplicate for all of them - dropping URLs one tenant happens to
+ * have would silently deny the posting to everyone else on the run.
+ *
+ * @param {Array<number>} userIds tenants the run is storing for
+ * @returns {Promise<Set<string>>}
+ */
+async function getSharedApplyUrls(userIds = []) {
+  if (!userIds.length) return new Set();
+  const { rows } = await query(
+    `SELECT apply_url
+       FROM jobs
+      WHERE user_id = ANY($1::int[])
+      GROUP BY apply_url
+     HAVING COUNT(DISTINCT user_id) = $2`,
+    [userIds, userIds.length]
+  );
+  return new Set(rows.map((row) => row.apply_url));
+}
+
+/**
+ * Company names these tenants already have postings from - used by
+ * `scripts/scrape.js` to report how many genuinely new employers a run reached.
+ *
+ * @param {Array<number>} userIds
+ * @returns {Promise<Set<string>>}
+ */
+async function getKnownCompanies(userIds = []) {
+  if (!userIds.length) return new Set();
+  const { rows } = await query(
+    `SELECT DISTINCT LOWER(company) AS company FROM jobs WHERE user_id = ANY($1::int[]) AND company IS NOT NULL`,
+    [userIds]
+  );
+  return new Set(rows.map((row) => row.company));
+}
+
+/**
  * Whether this tenant already stores a posting (used to skip re-scoring).
  *
  * @param {number} userId
@@ -472,6 +554,128 @@ async function deleteAllJobs(userId) {
   return rowCount;
 }
 
+/* ------------------------------------------------------------------ */
+/* Discovered ATS boards (shared, not per tenant)                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Records career pages the crawler found.
+ *
+ * Re-discovering a known board is the normal case (a dork returns the same
+ * company every month), so the insert is a no-op upsert that only fills in
+ * details the first discovery missed - it must never reset `last_scraped_at`,
+ * or a board rediscovered nightly would be scraped nightly while the rest of
+ * the registry starved.
+ *
+ * @param {Array<{platform:string, slug:string, company?:string, boardUrl?:string, via?:string}>} boards
+ * @returns {Promise<number>} boards that were new to the registry
+ */
+async function recordBoards(boards = []) {
+  let added = 0;
+
+  for (const board of boards) {
+    if (!board?.platform || !board?.slug) continue;
+    const { rows } = await query(
+      `INSERT INTO ats_boards (platform, slug, company, board_url, discovered_via)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (platform, LOWER(slug)) DO UPDATE
+          SET company   = COALESCE(ats_boards.company, EXCLUDED.company),
+              board_url = COALESCE(ats_boards.board_url, EXCLUDED.board_url)
+       RETURNING (xmax = 0) AS inserted`,
+      [
+        String(board.platform).slice(0, 32),
+        String(board.slug).slice(0, 255),
+        board.company ? String(board.company).slice(0, 255) : null,
+        board.boardUrl ? String(board.boardUrl).slice(0, 512) : null,
+        board.via ? String(board.via).slice(0, 64) : null,
+      ]
+    );
+    if (rows[0]?.inserted) added += 1;
+  }
+
+  return added;
+}
+
+/**
+ * The next boards to visit: healthy ones, least recently scraped first, so the
+ * registry is walked round-robin across runs instead of the same first N boards
+ * being re-scraped every night.
+ *
+ * @param {{limit?:number, platforms?:Array<string>}} [options]
+ * @returns {Promise<Array<{id:number, platform:string, slug:string, company:string|null, board_url:string|null}>>}
+ */
+async function getBoardsToScrape(options = {}) {
+  const params = [Math.max(1, options.limit || 40)];
+  let platformClause = '';
+
+  if (options.platforms?.length) {
+    params.push(options.platforms);
+    platformClause = `AND platform = ANY($${params.length}::text[])`;
+  }
+
+  const { rows } = await query(
+    `SELECT id, platform, slug, company, board_url
+       FROM ats_boards
+      WHERE ok = TRUE ${platformClause}
+      ORDER BY last_scraped_at NULLS FIRST, job_count DESC, id
+      LIMIT $1`,
+    params
+  );
+  return rows;
+}
+
+/**
+ * Marks a board visited. A board whose API answers but returns nothing is left
+ * healthy (companies do pause hiring); only a hard failure retires it.
+ *
+ * @param {string} platform
+ * @param {string} slug
+ * @param {{jobCount?:number, ok?:boolean, company?:string}} [result]
+ * @returns {Promise<void>}
+ */
+async function markBoardScraped(platform, slug, result = {}) {
+  await query(
+    `UPDATE ats_boards
+        SET last_scraped_at = NOW(),
+            job_count       = COALESCE($3, job_count),
+            ok              = COALESCE($4, ok),
+            company         = COALESCE($5, company)
+      WHERE platform = $1 AND LOWER(slug) = LOWER($2)`,
+    [
+      platform,
+      slug,
+      Number.isFinite(result.jobCount) ? result.jobCount : null,
+      typeof result.ok === 'boolean' ? result.ok : null,
+      result.company ? String(result.company).slice(0, 255) : null,
+    ]
+  );
+}
+
+/**
+ * Registry size, for the status endpoint and the CLI summary.
+ *
+ * @returns {Promise<{total:number, healthy:number, scraped:number, byPlatform:Record<string, number>}>}
+ */
+async function getBoardStats() {
+  const { rows } = await query(
+    `SELECT platform,
+            COUNT(*)::int                                        AS total,
+            COUNT(*) FILTER (WHERE ok)::int                      AS healthy,
+            COUNT(*) FILTER (WHERE last_scraped_at IS NOT NULL)::int AS scraped
+       FROM ats_boards
+      GROUP BY platform`
+  );
+
+  const stats = { total: 0, healthy: 0, scraped: 0, byPlatform: {} };
+  for (const row of rows) {
+    stats.total += row.total;
+    stats.healthy += row.healthy;
+    stats.scraped += row.scraped;
+    stats.byPlatform[row.platform] = row.total;
+  }
+  return stats;
+}
+
 /**
  * Closes the pool (graceful shutdown, and so test scripts can exit).
  * @returns {Promise<void>}
@@ -498,11 +702,19 @@ module.exports = {
   // jobs
   upsertJob,
   jobExists,
+  getKnownApplyUrls,
+  getSharedApplyUrls,
+  getKnownCompanies,
   updateJobMatchData,
   getJobs,
   getUnmatchedJobs,
   getStats,
   deleteJob,
   deleteAllJobs,
+  // discovered boards
+  recordBoards,
+  getBoardsToScrape,
+  markBoardScraped,
+  getBoardStats,
   close,
 };

@@ -26,7 +26,9 @@
 
 const { OpenAI } = require('openai');
 
+const { ROLE_TERMS, QUERY_TEMPLATES } = require('../config/sources');
 const { getResumes } = require('./database');
+const { extractUserSkills } = require('./parser');
 const { parseCompensation, meetsPayBar } = require('./compensation');
 const { buildCandidateProfile, assessRelevance } = require('./relevance');
 
@@ -57,6 +59,16 @@ const TOP_P = Number(process.env.MATCHER_TOP_P ?? 0.95);
 
 /** Canonical categories. The dashboard tabs key off these exact strings. */
 const JOB_TYPES = { INTERNSHIP: 'Internship', FULL_TIME: 'Full-Time Job' };
+
+/**
+ * The score a posting must reach before it is written to the database.
+ *
+ * The crawl is now open-ended - it discovers boards nobody configured, so it
+ * sees far more genuinely irrelevant work than the old fixed source list did.
+ * Storing all of it would bury the good rows and pay for the storage of every
+ * near-miss, so the bar is applied at insert time rather than at display time.
+ */
+const MIN_MATCH_SCORE = Number(process.env.MIN_MATCH_SCORE || 50);
 
 const client = API_KEY
   ? new OpenAI({ baseURL: BASE_URL, apiKey: API_KEY, timeout: REQUEST_TIMEOUT_MS, maxRetries: 0 })
@@ -513,6 +525,77 @@ function gatedMatch(job, resumes, relevance) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Search queries                                                      */
+/* ------------------------------------------------------------------ */
+
+/** Level words appended to a role so a run finds the entry rungs too. */
+const LEVEL_TERMS = ['Intern', 'Associate', 'Graduate'];
+
+/**
+ * Turns a user's resumes into the queries a run searches with.
+ *
+ * The pairing is deliberate. A bare skill ("Flutter") matches conference talks
+ * and course pages; a bare role ("Software Engineer") matches every posting on
+ * earth. `"<skill> <role>"` is the combination that returns postings a specific
+ * person could actually apply to, which is what both the ATS dorks and the feed
+ * filters are built from.
+ *
+ * Titles read off the resume come first, because a candidate's own last job
+ * title is a better query than any generic term - then the shared `ROLE_TERMS`
+ * vocabulary widens the net, and the level words reach the intern and associate
+ * rungs that a plain title search skips.
+ *
+ * @param {Array<{content?:string}>|{skills:Array<string>, titles:Array<string>, locations?:Array<string>}} input
+ *   resume rows, or an already-extracted vocabulary from `extractUserSkills`
+ * @param {{limit?:number, skillLimit?:number, locations?:Array<string>}} [options]
+ * @returns {Array<string>} distinct query strings, strongest first
+ */
+function buildSearchQueries(input, options = {}) {
+  const vocabulary = Array.isArray(input) ? extractUserSkills(input) : input || {};
+  const skills = (vocabulary.skills || []).slice(0, Math.max(1, options.skillLimit || 8));
+  const titles = vocabulary.titles || [];
+  const locations = options.locations || vocabulary.locations || [];
+
+  const limit = Math.max(1, options.limit || Number(process.env.MAX_SEARCH_QUERIES || 24));
+
+  // Resume titles first, then the generic vocabulary, with the duplicates a
+  // "Software Engineer" resume produces removed.
+  const roles = [...new Set([...titles, ...ROLE_TERMS])];
+  if (!skills.length) return roles.slice(0, limit);
+
+  const queries = [];
+  const add = (query) => {
+    const text = query.replace(/\s+/g, ' ').trim();
+    if (text && !queries.includes(text)) queries.push(text);
+  };
+
+  // Round-robin so the strongest skill is paired with several roles before the
+  // twelfth-ranked one is used at all.
+  for (let round = 0; round < roles.length && queries.length < limit; round += 1) {
+    for (let i = 0; i < skills.length && queries.length < limit; i += 1) {
+      const template = QUERY_TEMPLATES[(round + i) % QUERY_TEMPLATES.length];
+      add(template.replace('{skill}', skills[i]).replace('{role}', roles[(round + i) % roles.length]));
+    }
+  }
+
+  // Entry-level variants of the candidate's own titles.
+  for (const level of LEVEL_TERMS) {
+    for (const title of titles.slice(0, 2)) add(`${title} ${level}`);
+    if (skills[0]) add(`${skills[0]} Developer ${level}`);
+  }
+
+  // Where they can actually be hired. Workday takes these strings as its
+  // `searchText`, so a country here is the difference between a page of roles
+  // the candidate can take and a page the location gate will throw away.
+  for (const location of locations) {
+    for (const title of titles.slice(0, 2)) add(`${title} ${location}`);
+    for (const skill of skills.slice(0, 2)) add(`${skill} Developer ${location}`);
+  }
+
+  return queries.slice(0, limit);
+}
+
+/* ------------------------------------------------------------------ */
 /* Public API                                                          */
 /* ------------------------------------------------------------------ */
 
@@ -628,9 +711,52 @@ async function matchJobsForUser(userId, jobs, options = {}) {
   return results;
 }
 
+/* ------------------------------------------------------------------ */
+/* Verdict contract                                                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Whether a verdict carries every field the dashboard and the database depend
+ * on: the category, a numeric score, a justification, and the resume the score
+ * belongs to.
+ *
+ * `best_resume_id` is allowed to be null in exactly one case - the user has no
+ * resumes at all - because there is then no id to name, and refusing to store
+ * such a row would hide the "upload a resume" prompt the score carries.
+ *
+ * @param {object|null|undefined} matchData
+ * @returns {{ok:boolean, missing:Array<string>}}
+ */
+function verifyMatchShape(matchData) {
+  const missing = [];
+  if (!matchData || typeof matchData !== 'object') return { ok: false, missing: ['match_data'] };
+
+  if (matchData.job_type !== JOB_TYPES.INTERNSHIP && matchData.job_type !== JOB_TYPES.FULL_TIME) missing.push('job_type');
+  if (!Number.isFinite(Number(matchData.score))) missing.push('score');
+  if (!String(matchData.reason || '').trim()) missing.push('reason');
+  if (!('best_resume_id' in matchData)) missing.push('best_resume_id');
+
+  return { ok: missing.length === 0, missing };
+}
+
+/**
+ * Whether a verdict clears the storage bar (see `MIN_MATCH_SCORE`).
+ *
+ * @param {object|null|undefined} matchData
+ * @param {number} [minimum]
+ * @returns {boolean}
+ */
+function meetsMatchBar(matchData, minimum = MIN_MATCH_SCORE) {
+  return Number(matchData?.score) >= minimum;
+}
+
 module.exports = {
   matchJob,
   matchJobsForUser,
+  buildSearchQueries,
+  verifyMatchShape,
+  meetsMatchBar,
+  MIN_MATCH_SCORE,
   heuristicMatch,
   gatedMatch,
   keywordScore,

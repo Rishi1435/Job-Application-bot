@@ -1,17 +1,27 @@
 # Job Application Bot
 
-A multi-tenant, cloud-ready job hunting assistant. Users sign up, upload as many
-resumes as they like, and the bot scrapes a fixed list of trusted company career
-pages, asks an LLM on the NVIDIA API catalog to categorise each role
-(**Internship** vs **Full-Time Job**) and pick the best resume for it, then serves
-everything on a dark-mode dashboard with per-tab Excel export.
+A multi-tenant, cloud-ready job hunting assistant. Users sign up and upload as
+many resumes as they like; the bot reads their skills, **discovers** the career
+pages of companies hiring for those skills across thousands of employers, asks an
+LLM on the NVIDIA API catalog to categorise each role (**Internship** vs
+**Full-Time Job**) and pick the best resume for it, then serves everything on a
+dark-mode dashboard with per-tab Excel export.
 
 ```
-cron (00:00) ─▶ Puppeteer scraper ─▶ trusted-company filter ─▶ NVIDIA LLM matcher
-                                                                      │
-                            per-user match_data (JSONB) ─▶ PostgreSQL ─┘
-                                                                      │
-                             JWT-protected Express API ─▶ dashboard ─▶ .xlsx
+resumes ─▶ skills & titles ─▶ search queries
+                                   │
+        ┌──────────────────────────┼──────────────────────────┐
+        ▼                          ▼                          ▼
+  ATS search APIs           developer job feeds       search-engine dorks
+  (Greenhouse, Lever,       (RemoteOK, Arbeitnow,     (Puppeteer ─▶ DuckDuckGo,
+   Ashby, Workday)           HN "Who is hiring?")      discovers new boards)
+        └──────────────────────────┼──────────────────────────┘
+                                   ▼
+        trusted-ATS-domain filter ─▶ skill filter ─▶ already-seen filter
+                                   │
+                     NVIDIA LLM matcher ─▶ score >= 50 ─▶ PostgreSQL
+                                   │
+                     JWT-protected Express API ─▶ dashboard ─▶ .xlsx
 ```
 
 ## Features
@@ -26,11 +36,21 @@ cron (00:00) ─▶ Puppeteer scraper ─▶ trusted-company filter ─▶ NVIDI
   `mammoth`, straight from multer's memory storage. Only the extracted text is
   persisted; no file ever touches the disk, which is what makes this safe on
   Render's ephemeral filesystem.
-- **Trusted-source scraping** - Puppeteer visits *only* the URLs in
-  [config/sources.js](config/sources.js). Every company that owns a configured
-  board is trusted automatically, so adding a career page is a one-line change;
-  `TRUSTED_COMPANIES` is only for boards that list somebody else's postings.
-  26 boards ship by default, weighted towards employers hiring in India.
+- **Skill-driven discovery** - there is no company list. `extractUserSkills()`
+  reads the stack and job titles out of the uploaded resumes, and those become
+  the search queries: ATS dorks (`site:jobs.lever.co "Flutter" OR "Dart"`), the
+  `searchText` sent to Workday, and the keyword filter every listing has to pass.
+  Two candidates with different stacks reach two different sets of employers.
+- **Three discovery channels** - public ATS APIs (Greenhouse, Lever, Ashby,
+  Workday), open developer feeds (RemoteOK, Arbeitnow, the Hacker News "Who is
+  hiring?" thread), and Puppeteer-driven search-engine crawling. Every career
+  page found is remembered in the `ats_boards` table and revisited
+  least-recently-first, so the reach of a run grows with every crawl.
+- **Trusted ATS domains** - a discovered URL is only followed when it lives on a
+  known applicant-tracking domain (`greenhouse.io`, `lever.co`, `ashbyhq.com`,
+  `workday.com`, plus the feed domains). This replaced the old trusted-company
+  allow-list: it is what keeps aggregator spam and reposted ghost listings out of
+  the database now that the employer set is open-ended.
 - **Relevance gate** - every posting is screened against a profile derived from
   the candidate's resumes - seniority, role family and country - *before* it
   reaches the LLM. Roles in another field, several levels above them, or in
@@ -66,10 +86,9 @@ npm start                    # http://localhost:3000
 
 Open the dashboard, create an account, upload a resume, then hit **Run Scrape**.
 
-The bundled offline board (`mock-job-board.html`) is off by default because its
-apply URLs point at `*.example.com`, which resolves nowhere - a board full of
-dead "Apply" buttons. Set `ENABLE_MOCK_BOARD=true` to run the pipeline with no
-network access.
+The first run has no discovered boards yet, so it leans on the job feeds and the
+search crawl; from the second run onwards the `ats_boards` registry carries it.
+Nothing needs to be configured for a company to be reachable.
 
 `npm run scrape` does the same thing from the CLI (`-- --user <id|name>` for one
 tenant, `-- --rescore` to re-run the matcher over postings that were stored
@@ -91,12 +110,12 @@ scoring plus a regex categoriser, and says so in the match reason.
 | [server.js](server.js) | Express app, auth + upload routes, cron schedule, graceful shutdown |
 | [services/auth.js](services/auth.js) | bcrypt hashing, JWT issuing, `requireAuth` middleware |
 | [services/database.js](services/database.js) | PostgreSQL pool, schema, tenant-scoped parameterised queries |
-| [services/scraper.js](services/scraper.js) | Puppeteer crawl, trusted-company filter, per-tenant persistence |
+| [services/scraper.js](services/scraper.js) | Board discovery, the three collection channels, trusted-domain filter, per-tenant persistence |
 | [services/matcher.js](services/matcher.js) | NVIDIA LLM prompt, JSON validation, keyword fallback |
 | [services/compensation.js](services/compensation.js) | Pay extraction (LPA/CTC/foreign/monthly) and the pay bar |
 | [services/relevance.js](services/relevance.js) | Candidate profile, and the seniority / role-family / location gate |
 | [services/parser.js](services/parser.js) | HTML extraction + in-memory PDF/DOCX resume parsing |
-| [config/sources.js](config/sources.js) | Career-page URLs, ATS selector profiles, trusted companies |
+| [config/sources.js](config/sources.js) | Trusted ATS domains, ATS API patterns, query/dork templates, selector profiles |
 | [public/](public/) | Dashboard (vanilla HTML/CSS/JS, dark theme) |
 | [scripts/scrape.js](scripts/scrape.js) | `npm run scrape` - CLI run, all users or one |
 | [scripts/rescreen.js](scripts/rescreen.js) | `npm run rescreen` - re-apply the gate to stored postings, no LLM calls |
@@ -121,11 +140,18 @@ list. The ones that matter most:
 | `MIN_LPA_CTC` | `15` | Floor for postings quoting CTC / total package |
 | `INTERNSHIP_ENFORCE_PAY` | `false` | Apply the bar to internships too |
 | `INR_PER_USD` | `88` | FX used to convert foreign pay to LPA |
-| `TRUSTED_COMPANIES` | list in `config/sources.js` | Comma-separated allow-list override |
-| `ENABLED_SOURCES` | *(unset)* | Comma-separated source ids |
+| `TRUSTED_ATS_DOMAINS` | list in `config/sources.js` | Comma-separated domain allow-list override |
+| `ENABLED_CHANNELS` | all three | `ats-api`, `job-feeds`, `search-crawl` |
+| `MIN_MATCH_SCORE` | `50` | A posting scoring below this is never stored |
+| `SCRAPER_MAX_BOARDS` | `40` | Boards from the registry visited per run |
+| `SCRAPER_MAX_NEW_JOBS` | `150` | Ceiling on postings handed to the matcher per run |
+| `SCRAPER_MAX_DORKS` | `6` | Search-engine queries per run |
+| `SCRAPER_SEARCH_DELAY_MS` | `6000` | Pause between search queries; below ~5s engines start throttling |
+| `SCRAPER_FEED_SHARE` | `0.25` | Share of the run's budget reserved for the job feeds |
+| `MAX_SEARCH_SKILLS` | `12` | Skills taken from the resumes to search with |
 | `SCRAPER_DETAIL_LIMIT` | `3` | Job pages opened per board for the full description |
 | `MAX_JOBS_PER_SOURCE` | `25` | Cap per board per run |
-| `ENABLE_MOCK_BOARD` | `false` | Offline demo board. Its apply URLs are `*.example.com` and resolve nowhere |
+| `SEARCH_ENGINE` | all four | Restrict the search crawl, e.g. `brave,duckduckgo-html` |
 | `RELEVANCE_MAX_LEVEL_STRETCH` | `1` | How many rungs above the candidate a posting may sit |
 | `CRON_SCHEDULE` | `*/30 * * * *` | Every 30 minutes, for all tenants. Any 5-field cron expression |
 | `RUN_ON_STARTUP` | `false` | Scrape once on boot |
@@ -232,63 +258,84 @@ All routes except `/api/auth/*` and `/api/health` require
 | `GET` | `/api/jobs/stats` | Totals, per-category counts, average score |
 | `DELETE` | `/api/jobs/:id`, `/api/jobs` | Remove one posting / clear the board |
 | `POST` | `/api/scrape` | Run the pipeline now for the calling user (409 if busy) |
-| `GET` | `/api/status` | Scheduler state, sources, trusted companies, last run |
+| `GET` | `/api/status` | Scheduler state, discovery channels, trusted domains, board registry, this user's search queries, last run |
 | `GET` | `/api/health` | Liveness probe (public) |
 
-## Adding a company
+## How discovery works
 
-One line in [config/sources.js](config/sources.js):
+There is nothing to add: companies arrive on their own.
 
-```js
-const SOURCE_URLS = [
-  'https://job-boards.greenhouse.io/your-company',   // Greenhouse / Lever / Ashby
-];
+**1. The resumes become a vocabulary.** `extractUserSkills()` in
+[services/parser.js](services/parser.js) ranks the technologies a resume actually
+leans on (by mention count, so a stack beats a tool named once in a course list)
+and reads the job titles it claims. `buildSearchQueries()` in
+[services/matcher.js](services/matcher.js) pairs them with role and level terms:
 
-// Optional - only to override the name derived from the slug.
-const SOURCE_OVERRIDES = {
-  'https://job-boards.greenhouse.io/your-company': { company: 'Your Company' },
-};
+```
+Node.js, Spring Boot, Flutter, PostgreSQL, AWS + Full Stack Developer, Backend Developer
+  ─▶ "Node.js Full Stack Developer", "Flutter Developer Intern", "Spring Boot Associate", ...
 ```
 
-The employer is trusted automatically because the board belongs to them; there is
-no second list to keep in sync. Greenhouse, Lever and Ashby URLs are recognised by
-hostname and get their selectors from the matching ATS profile. Anything else
-falls back to the `generic` profile plus the anchor-scan heuristic.
+**2. Three channels turn queries into postings.**
 
-**Verify before trusting it.** Two failure modes look identical to a working
-board until you check:
+| Channel | What it does | Needs a browser |
+| --- | --- | --- |
+| `ats-api` | Reads every discovered board through Greenhouse / Lever / Ashby / Workday's public JSON API. Full descriptions come back in one request, so no detail page is opened | no |
+| `job-feeds` | RemoteOK and Arbeitnow listings, plus the Hacker News "Who is hiring?" thread mined for the ATS links in its comments | no |
+| `search-crawl` | Puppeteer runs dorks (`site:jobs.lever.co "Flutter" OR "Dart" India`) against DuckDuckGo and keeps every career page in the results | yes (falls back to plain HTTP) |
 
-```bash
-ENABLED_SOURCES=<id> npm run scrape -- --user <you>
-```
+**3. Boards are remembered.** Every career page discovered is upserted into the
+`ats_boards` table and revisited least-recently-scraped first, so each run reaches
+companies the last one did not. The registry is shared across tenants - a board
+found while scraping for one user is a board everyone's run can search. A board
+whose API stops answering is marked `ok = false` and stops being retried.
 
-- **A redirect.** `job-boards.greenhouse.io/databricks` answers 200 and then
-  sends you to `databricks.com`, which no ATS profile can read. Stripe, Asana,
-  Elastic, Datadog, Instacart, Samsara and MongoDB all do the same.
-- **An empty shell.** Zepto, Juspay, Hasura, Darwinbox, Rippling and Slice all
-  return a valid, well-formed board containing no postings. That is worse than no
-  source at all: it scrapes cleanly, finds nothing, and looks like a selector bug.
+**4. Four gates run before anything is paid for.**
 
-Check the board's terms and `robots.txt` first - the scraper is polite (delays,
-realistic headers) but makes no attempt to defeat bot challenges or logins.
+- **Trusted domain** - the URL must be on an ATS or feed domain
+  (`greenhouse.io`, `lever.co`, `ashbyhq.com`, `workday.com`, ...). Matching is on
+  the registrable suffix, so every tenant of a platform is covered by one entry.
+- **On the candidate's stack** - the title or description must hit one of their
+  skills, matched as a whole token (a substring test accepts "Go" inside
+  "go-to-market", which on an open crawl is no filter at all).
+- **Somewhere they can work** - the same location check the relevance gate uses,
+  applied at collection time so the run's budget is not spent on roles the gate
+  will reject anyway. The country also goes into the dorks and into Workday's
+  `searchText`.
+- **Not already seen** - apply URLs already stored for every tenant on the run are
+  dropped before any detail fetch or LLM call.
+
+Only then does the LLM score the posting, and only a verdict of **50 or above**
+is written to the database (`MIN_MATCH_SCORE`).
+
+Rate limits are real and every engine handles them differently: DuckDuckGo
+answers a burst of dorks with HTTP 202 and an interstitial that looks like a
+result page, while Brave refuses roughly every other query with a 429 and then
+serves twenty boards. So the crawler rotates engines, counts *consecutive*
+refusals rather than retiring an engine on the first one, and gives up on the
+search channel only when all of them are refusing - the other two channels do not
+need a search engine at all. Check a board's terms and `robots.txt` before
+widening `TRUSTED_ATS_DOMAINS`: the crawler is polite (delays, realistic headers)
+but makes no attempt to defeat bot challenges or logins.
 
 ## Scheduling
 
 `server.js` registers the cron job in-process, so the board refreshes for as
 long as the server is up. The default is every 30 minutes (`CRON_SCHEDULE`).
 
-Why a frequent schedule is cheap: postings are de-duplicated per tenant on their
-apply URL, so a repeat sighting only refreshes the stored row - **the LLM is
-called for genuinely new listings only**. A measured cycle on the demo board went
-19.4s on the first run (3 postings scored per user) and 1.0s on the next, with
-zero LLM calls. Overlap is impossible: a trigger that fires while a scrape is
-still running is skipped with a warning.
+Why a frequent schedule is cheap: apply URLs already stored are dropped before
+any detail fetch or LLM call, so **the LLM is called for genuinely new listings
+only**, and the board registry is walked least-recently-scraped first, so
+consecutive runs visit different companies rather than re-reading the same ones.
+Overlap is impossible: a trigger that fires while a scrape is still running is
+skipped with a warning.
 
 Two caveats:
 
-- **Politeness.** Every 30 minutes is ~48 visits per board per day. That is fine
-  for a handful of career pages, but keep `SCRAPER_DETAIL_LIMIT` low and do not
-  add dozens of sources on this cadence.
+- **Politeness.** `SCRAPER_MAX_BOARDS` bounds how many career pages a run touches
+  and `SCRAPER_MAX_DORKS` how many search queries it issues; both matter far more
+  than the cron interval. Raising them on a 30-minute schedule is what turns a
+  polite crawler into a nuisance.
 - **Render free instances sleep.** An in-process cron cannot fire while the
   service is spun down. Use a paid instance, or move the schedule to a Render
   Cron Job running `npm run scrape` and set `CRON_SCHEDULE` to something inert.

@@ -23,10 +23,10 @@ const db = require('./services/database');
 const auth = require('./services/auth');
 const { extractResumeText, detectResumeKind } = require('./services/parser');
 const { runScraper, runScraperForUser, isRunning, getLastRun } = require('./services/scraper');
-const { MODEL, isLlmEnabled } = require('./services/matcher');
+const { MODEL, isLlmEnabled, buildSearchQueries, MIN_MATCH_SCORE } = require('./services/matcher');
 const { buildCandidateProfile } = require('./services/relevance');
 const { MIN_LPA_SALARY, MIN_LPA_CTC } = require('./services/compensation');
-const { getEnabledSources, getTrustedCompanies } = require('./config/sources');
+const { getEnabledChannels, getTrustedDomains } = require('./config/sources');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -245,19 +245,28 @@ app.post(
   })
 );
 
-/** GET /api/status - scheduler state, configured sources and the last run. */
+/**
+ * GET /api/status - scheduler state, the discovery channels, and what *this*
+ * user's next run will search for. There is no source list any more: the
+ * equivalent answer to "where do the jobs come from?" is the channel set plus
+ * the size of the discovered-board registry.
+ */
 app.get(
   '/api/status',
   auth.requireAuth,
   asyncRoute(async (req, res) => {
+    const resumes = await db.getResumes(req.user.id);
+
     res.json({
       running: isRunning(),
       cronSchedule: CRON_SCHEDULE,
       timezone: CRON_TIMEZONE || Intl.DateTimeFormat().resolvedOptions().timeZone,
-      matcher: { model: MODEL, llmEnabled: isLlmEnabled() },
+      matcher: { model: MODEL, llmEnabled: isLlmEnabled(), minScore: MIN_MATCH_SCORE },
       payBar: { salaryLpa: MIN_LPA_SALARY, ctcLpa: MIN_LPA_CTC },
-      sources: getEnabledSources().map((source) => ({ id: source.id, name: source.name, company: source.company })),
-      trustedCompanies: getTrustedCompanies(),
+      channels: getEnabledChannels(),
+      trustedDomains: getTrustedDomains(),
+      boards: await db.getBoardStats(),
+      search: { queries: buildSearchQueries(resumes).slice(0, 10) },
       lastRun: getLastRun(),
     });
   })

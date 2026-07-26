@@ -11,6 +11,10 @@
  *   npm run scrape -- --user alice    one user (id or username)
  *   npm run scrape -- --rescore       re-run the matcher over stored postings
  *                                     that never got a match_data verdict
+ *
+ * The summary reports the employers and domains the run reached that were not
+ * already in the database, which is the measure that matters now that the crawl
+ * discovers companies instead of revisiting a fixed list.
  */
 
 require('dotenv').config();
@@ -31,6 +35,35 @@ function parseArgs(argv) {
     if (argv[i] === '--rescore') args.rescore = true;
   }
   return args;
+}
+
+/**
+ * The distinct hosts a set of tenants' postings apply through, which is how a
+ * run's reach is measured: two Greenhouse boards are two companies, and the
+ * host is the part that cannot be spelled two ways.
+ *
+ * @param {Array<number>} userIds
+ * @returns {Promise<Set<string>>}
+ */
+async function applyDomains(userIds) {
+  const { rows } = await db.query(
+    `SELECT DISTINCT apply_url FROM jobs WHERE user_id = ANY($1::int[])`,
+    [userIds]
+  );
+
+  const domains = new Set();
+  for (const row of rows) {
+    try {
+      const { hostname, pathname } = new URL(row.apply_url);
+      // On a shared ATS host the board slug is the company, so the first path
+      // segment has to be part of the identity.
+      const slug = pathname.split('/').filter(Boolean)[0] || '';
+      domains.add(`${hostname}/${slug}`.toLowerCase());
+    } catch {
+      // A malformed stored URL is not worth failing a summary over.
+    }
+  }
+  return domains;
 }
 
 /**
@@ -105,14 +138,38 @@ async function rescore(userIds) {
       process.exit(0);
     }
 
+    // Snapshotted before the run so "new" means new to the database, not just
+    // new to this crawl.
+    const knownCompanies = await db.getKnownCompanies(userIds);
+    const knownDomains = await applyDomains(userIds);
+
     const summary = await runScraper({ trigger: 'manual', userIds });
+
+    const companiesAfter = await db.getKnownCompanies(userIds);
+    const domainsAfter = await applyDomains(userIds);
+    const newCompanies = [...companiesAfter].filter((company) => !knownCompanies.has(company));
+    const newDomains = [...domainsAfter].filter((domain) => !knownDomains.has(domain));
+    const boards = await db.getBoardStats();
 
     console.log('\n--- Scrape summary ---------------------------');
     console.log(`Status       : ${summary.status}`);
-    console.log(`Postings     : ${summary.found} found across the trusted sources`);
-    console.log(`Stored       : ${summary.inserted} new, ${summary.updated} refreshed`);
+    console.log(`Searched for : ${(summary.skills || []).join(', ') || '(no skills read from any resume)'}`);
+    console.log(`Boards       : ${boards.total} known (${boards.healthy} healthy), ${summary.discovery?.boardsNew ?? 0} discovered this run`);
+    console.log(`             : ${Object.entries(boards.byPlatform).map(([key, count]) => `${key} ${count}`).join(', ')}`);
+    console.log(`Postings     : ${summary.found} new and skill-matched, from ${summary.discovery?.companies?.length ?? 0} compan(ies)`);
+    console.log(`Filtered     : ${summary.discovery?.duplicates ?? 0} already seen, ${summary.discovery?.offStack ?? 0} off-stack, ${summary.discovery?.elsewhere ?? 0} wrong country, ${summary.discovery?.untrusted ?? 0} untrusted domain`);
+    console.log(`Stored       : ${summary.inserted} new, ${summary.belowBar} below the match bar`);
     console.log(`LLM scored   : ${summary.scored}`);
     console.log(`Users        : ${summary.users}`);
+    // Reached vs stored: the crawl can discover an employer the match bar then
+    // rejects, and both numbers matter - one measures the crawl, the other the
+    // board.
+    const reached = (summary.discovery?.companies || []).filter(
+      (company) => company && !knownCompanies.has(String(company).toLowerCase())
+    );
+    console.log(`New reached  : ${reached.length} employer(s) never seen before - ${reached.slice(0, 15).join(', ') || 'none'}`);
+    console.log(`New stored   : ${newCompanies.length} - ${newCompanies.slice(0, 15).join(', ') || 'none'}`);
+    console.log(`New domains  : ${newDomains.length} - ${newDomains.slice(0, 15).join(', ') || 'none'}`);
     if (summary.errors.length) {
       console.log('Errors       :');
       summary.errors.forEach((error) => console.log(`  - ${error}`));

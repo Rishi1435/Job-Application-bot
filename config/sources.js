@@ -1,189 +1,488 @@
 /**
- * Scrape targets.
+ * Dynamic source registry.
  *
- * The engine is config-driven and *closed by default*: it only ever visits the
- * URLs listed in `SOURCE_URLS`, and only keeps postings whose employer appears
- * in `TRUSTED_COMPANIES`. Adding a board means adding a line here, not writing
- * new scraping code.
+ * There is no company list in this file any more. The engine used to iterate a
+ * hand-written array of ~30 career pages, which meant the bot could only ever
+ * find jobs at companies somebody had already thought of. It now *discovers*
+ * employers at run time and keeps them in the `ats_boards` table, so the reach
+ * of a run grows with every crawl instead of with every commit.
  *
- * Every URL is classified into an ATS "profile" (Greenhouse / Lever / Ashby /
- * local file) which supplies the CSS selectors. Boards restyle their markup
- * regularly, so `services/scraper.js` falls back to a generic anchor scan when
- * a profile's selectors match nothing.
+ * What stays here is the part that genuinely is configuration:
+ *
+ *   1. TRUSTED ATS DOMAINS - the domain extensions a posting may live on. This
+ *      is the replacement for the old `TRUSTED_COMPANIES` allow-list, and it is
+ *      what keeps the pipeline closed by default: a discovered URL is only
+ *      followed when it belongs to a real applicant tracking system, so an
+ *      aggregator, a content farm or a scraped-and-reposted ghost listing never
+ *      enters the database however it was found.
+ *   2. ATS SEARCH PATTERNS - how to turn a board slug into that platform's
+ *      public JSON endpoint (Greenhouse, Lever, Ashby, Workday).
+ *   3. QUERY TEMPLATES - the role vocabulary and the search-engine dorks that
+ *      skills extracted from the user's resumes are substituted into.
+ *   4. ATS SELECTOR PROFILES - retained for the HTML paths (a board page or a
+ *      job detail page that has to be read with Cheerio rather than an API).
  *
  * Runtime overrides:
- *   ENABLED_SOURCES=greenhouse-anthropic,mock-board   (comma separated ids)
- *   TRUSTED_COMPANIES=Anthropic,Figma                 (replaces the list below)
+ *   TRUSTED_ATS_DOMAINS=greenhouse.io,lever.co   (replaces the domain list)
+ *   ENABLED_CHANNELS=ats-api,job-feeds           (subset of the three channels)
+ *   SEARCH_ENGINE=duckduckgo-html|duckduckgo-lite|bing
  */
 
 /* ------------------------------------------------------------------ */
-/* Trusted employers                                                   */
+/* Trusted ATS domains                                                 */
 /* ------------------------------------------------------------------ */
 
 /**
- * Allow-list of employers. A scraped posting is discarded unless its company
- * matches one of these (case/punctuation insensitive), which keeps aggregator
- * spam and reposted ghost jobs out of the database.
+ * Domain extensions a job URL may live on.
+ *
+ * Matching is on the *registrable suffix*, so every tenant of a platform is
+ * covered by one entry: `job-boards.greenhouse.io`, `boards.eu.greenhouse.io`
+ * and `acme.wd5.myworkdayjobs.com` all pass without being listed.
  *
  * @type {Array<string>}
  */
-/**
- * Extra employers to accept beyond the ones that own a configured board.
- *
- * Normally this stays empty: `getTrustedCompanies()` already trusts every
- * company in `SOURCE_URLS`, because a single-employer career page is
- * authoritative about who is hiring. Add a name here only for a board that
- * lists postings from someone else (a parent company, or an acquired brand
- * still posting under its own name).
- *
- * @type {Array<string>}
- */
-const TRUSTED_COMPANIES = [];
+const ATS_DOMAINS = ['greenhouse.io', 'lever.co', 'ashbyhq.com', 'workday.com', 'myworkdayjobs.com', 'workdayjobs.com'];
 
 /**
- * Employers that only exist on the bundled offline board. Their apply URLs point
- * at `*.example.com`, which is reserved by RFC 2606 and resolves nowhere - so
- * they are only admitted while the demo board itself is switched on. Leaving
- * them permanently on the allow-list is what put dead "Apply" links on a
- * dashboard that was otherwise scraping real boards.
+ * Open developer job feeds. Their postings are hosted on the feed's own domain
+ * (RemoteOK and Arbeitnow both redirect through a permalink they control), so
+ * the domains are trusted for the same reason an ATS domain is: the operator is
+ * known and the link is stable.
  *
  * @type {Array<string>}
  */
-const DEMO_COMPANIES = [
-  'Tech Innovators Inc.',
-  'Data Systems LLC',
-  'Bright Apps Studio',
-  'Fintech Core Systems',
-  'CloudScale Ops',
-];
+const FEED_DOMAINS = ['remoteok.com', 'arbeitnow.com', 'ycombinator.com'];
 
-/** Whether the offline demo board is part of the rotation. Off by default. */
-const mockBoardEnabled = () => String(process.env.ENABLE_MOCK_BOARD || 'false').toLowerCase() === 'true';
+/**
+ * The active domain allow-list, honouring the TRUSTED_ATS_DOMAINS override.
+ * @returns {Array<string>}
+ */
+function getTrustedDomains() {
+  const override = (process.env.TRUSTED_ATS_DOMAINS || '')
+    .split(',')
+    .map((domain) => domain.trim().toLowerCase())
+    .filter(Boolean);
+
+  return override.length ? override : [...ATS_DOMAINS, ...FEED_DOMAINS];
+}
+
+/**
+ * Whether a URL sits on a trusted domain (or one of its subdomains).
+ *
+ * @param {string} url
+ * @returns {boolean}
+ */
+function isTrustedJobUrl(url) {
+  let host;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;
+    host = parsed.hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+
+  return getTrustedDomains().some((domain) => host === domain || host.endsWith(`.${domain}`));
+}
 
 /* ------------------------------------------------------------------ */
-/* Career pages                                                        */
+/* ATS search patterns                                                 */
 /* ------------------------------------------------------------------ */
 
 /**
- * The only URLs the scraper is allowed to open.
+ * Public, unauthenticated endpoints for the four platforms that host most
+ * software job postings.
  *
- * Each of these was checked to serve its ATS's own markup. Some companies
- * (Databricks, Stripe) redirect their `greenhouse.io/<slug>` URL to a bespoke
- * careers site, which no ATS profile can read - verify a new board with
- * `ENABLED_SOURCES=<id> npm run scrape` before relying on it.
+ * Every one of these returns the *full* job description, which is why the
+ * engine prefers them to rendering the board in Chromium: one HTTP request
+ * replaces a page load plus N detail-page loads, and the text the matcher
+ * reasons over is the canonical one rather than whatever survived a CSS
+ * selector.
  *
- * @type {Array<string>}
+ * Contract per platform:
+ *   dorkSite   the host to aim a `site:` search at
+ *   boardUrl   human-facing board page for a slug
+ *   apiUrl     JSON endpoint for a slug (null when it needs a POST body)
+ *   slugFrom   pulls the board slug out of any URL on that platform
+ *
+ * @type {Record<string, {label:string, domains:Array<string>, dorkSites:Array<string>, boardUrl:(slug:string)=>string, apiUrl:?(slug:string)=>string, slugFrom:(parsed:URL)=>string|null}>}
  */
-const SOURCE_URLS = [
-  // --- Hiring in India -------------------------------------------------
-  // Each of these was confirmed to serve its ATS's own markup *and* to return
-  // postings. A board that answers 200 with an empty shell (Zepto, Juspay,
-  // Hasura, Darwinbox, Rippling and Slice all do) is worse than no source: it
-  // scrapes cleanly, finds nothing, and looks like a selector bug.
-  'https://job-boards.greenhouse.io/groww',
-  'https://job-boards.greenhouse.io/phonepe',
-  'https://job-boards.greenhouse.io/hackerrank',
-  'https://job-boards.greenhouse.io/postman',
-  'https://job-boards.greenhouse.io/zscaler',
-  'https://job-boards.greenhouse.io/razorpaysoftwareprivatelimited',
-  'https://job-boards.greenhouse.io/tekion',
-  'https://job-boards.greenhouse.io/newrelic',
-  'https://job-boards.greenhouse.io/coursera',
-  'https://jobs.lever.co/cred',
-  'https://jobs.lever.co/meesho',
-  'https://jobs.lever.co/zeta',
-  'https://jobs.lever.co/porter',
-  'https://jobs.lever.co/mindtickle',
-  'https://jobs.lever.co/hevodata',
-  'https://jobs.ashbyhq.com/atlan',
+const ATS_PLATFORMS = {
+  greenhouse: {
+    label: 'Greenhouse',
+    domains: ['greenhouse.io'],
+    dorkSites: ['job-boards.greenhouse.io', 'boards.greenhouse.io'],
+    boardUrl: (slug) => `https://job-boards.greenhouse.io/${slug}`,
+    apiUrl: (slug) => `https://boards-api.greenhouse.io/v1/boards/${encodeURIComponent(slug)}/jobs?content=true`,
+    // https://job-boards.greenhouse.io/<slug>[/jobs/<id>]
+    slugFrom: (parsed) => parsed.pathname.split('/').filter(Boolean)[0] || null,
+  },
 
-  // --- Global boards with India offices or remote hiring -----------------
-  'https://job-boards.greenhouse.io/gitlab',
-  'https://job-boards.greenhouse.io/twilio',
-  'https://job-boards.greenhouse.io/airtable',
+  lever: {
+    label: 'Lever',
+    domains: ['lever.co'],
+    dorkSites: ['jobs.lever.co'],
+    boardUrl: (slug) => `https://jobs.lever.co/${slug}`,
+    apiUrl: (slug) => `https://api.lever.co/v0/postings/${encodeURIComponent(slug)}?mode=json`,
+    // https://jobs.lever.co/<slug>[/<uuid>]
+    slugFrom: (parsed) => parsed.pathname.split('/').filter(Boolean)[0] || null,
+  },
 
-  // --- Global boards ---------------------------------------------------
-  'https://job-boards.greenhouse.io/anthropic',
-  'https://job-boards.greenhouse.io/discord',
-  'https://job-boards.greenhouse.io/figma',
-  'https://job-boards.greenhouse.io/reddit',
-  'https://jobs.ashbyhq.com/openai',
-  'https://jobs.ashbyhq.com/ramp',
-  'https://jobs.lever.co/spotify',
-];
+  ashby: {
+    label: 'Ashby',
+    domains: ['ashbyhq.com'],
+    dorkSites: ['jobs.ashbyhq.com'],
+    boardUrl: (slug) => `https://jobs.ashbyhq.com/${slug}`,
+    apiUrl: (slug) => `https://api.ashbyhq.com/posting-api/job-board/${encodeURIComponent(slug)}`,
+    // https://jobs.ashbyhq.com/<slug>[/<uuid>]
+    slugFrom: (parsed) => parsed.pathname.split('/').filter(Boolean)[0] || null,
+  },
 
-/**
- * Per-URL metadata. Anything omitted is inferred: the company name comes from
- * the board slug and the selectors come from the ATS profile.
- * `enabled: false` keeps a source in the file but out of the rotation.
- */
-const SOURCE_OVERRIDES = {
-  'https://job-boards.greenhouse.io/groww': { company: 'Groww' },
-  'https://job-boards.greenhouse.io/phonepe': { company: 'PhonePe' },
-  'https://job-boards.greenhouse.io/hackerrank': { company: 'HackerRank' },
-  'https://job-boards.greenhouse.io/postman': { company: 'Postman' },
-  'https://job-boards.greenhouse.io/zscaler': { company: 'Zscaler' },
-  'https://jobs.lever.co/cred': { company: 'CRED' },
-  'https://jobs.lever.co/meesho': { company: 'Meesho' },
-  'https://jobs.lever.co/zeta': { company: 'Zeta' },
-  'https://jobs.lever.co/porter': { company: 'Porter' },
-  'https://jobs.lever.co/mindtickle': { company: 'Mindtickle' },
-  'https://jobs.lever.co/hevodata': { company: 'Hevo Data' },
-  'https://jobs.ashbyhq.com/atlan': { company: 'Atlan' },
-  // The Greenhouse slug is the registered entity, not the brand.
-  'https://job-boards.greenhouse.io/razorpaysoftwareprivatelimited': { company: 'Razorpay' },
-  'https://job-boards.greenhouse.io/tekion': { company: 'Tekion' },
-  'https://job-boards.greenhouse.io/newrelic': { company: 'New Relic' },
-  'https://job-boards.greenhouse.io/coursera': { company: 'Coursera' },
-  'https://job-boards.greenhouse.io/gitlab': { company: 'GitLab' },
-  'https://job-boards.greenhouse.io/twilio': { company: 'Twilio' },
-  'https://job-boards.greenhouse.io/airtable': { company: 'Airtable' },
-
-  'https://job-boards.greenhouse.io/anthropic': { company: 'Anthropic' },
-  'https://job-boards.greenhouse.io/discord': { company: 'Discord' },
-  'https://job-boards.greenhouse.io/figma': { company: 'Figma' },
-  'https://job-boards.greenhouse.io/reddit': { company: 'Reddit' },
-  'https://jobs.ashbyhq.com/openai': { company: 'OpenAI' },
-  'https://jobs.ashbyhq.com/ramp': { company: 'Ramp' },
-  'https://jobs.lever.co/spotify': { company: 'Spotify' },
+  workday: {
+    label: 'Workday',
+    domains: ['myworkdayjobs.com', 'workdayjobs.com', 'workday.com'],
+    dorkSites: ['myworkdayjobs.com'],
+    // Workday is multi-tenant *and* multi-site, so one slug has to carry both:
+    // "<host>/<site>", e.g. "acme.wd5.myworkdayjobs.com/AcmeCareers".
+    boardUrl: (slug) => `https://${slug.split('/')[0]}/en-US/${slug.split('/')[1] || ''}`,
+    // The search endpoint is a POST with a JSON body - see `fetchWorkdayBoard`.
+    apiUrl: null,
+    slugFrom: (parsed) => {
+      // /en-US/<site>/job/... , /<site>/job/... or /en-US/<site>
+      const parts = parsed.pathname.split('/').filter(Boolean);
+      const site = parts.find((part) => !/^[a-z]{2}-[A-Z]{2}$/.test(part) && part !== 'job' && part !== 'details');
+      return site ? `${parsed.hostname.toLowerCase()}/${site}` : null;
+    },
+  },
 };
 
 /**
- * Offline board bundled with the repo. It is a real source as far as the engine
- * is concerned, which makes the whole pipeline runnable with no network access.
+ * Workday's job-search endpoint for a `<host>/<site>` slug.
+ *
+ * @param {string} slug
+ * @returns {{url:string, tenant:string, host:string, site:string}|null}
  */
-const LOCAL_SOURCES = [
+function workdayEndpoint(slug) {
+  const [host, site] = String(slug || '').split('/');
+  if (!host || !site) return null;
+  const tenant = host.split('.')[0];
+  return { url: `https://${host}/wday/cxs/${tenant}/${site}/jobs`, tenant, host, site };
+}
+
+/**
+ * Identifies the ATS behind any URL.
+ *
+ * @param {string} url
+ * @returns {string} platform key, or 'generic'
+ */
+function detectAts(url) {
+  let host = '';
+  try {
+    host = new URL(url).hostname.toLowerCase();
+  } catch {
+    return 'generic';
+  }
+
+  for (const [key, platform] of Object.entries(ATS_PLATFORMS)) {
+    if (platform.domains.some((domain) => host === domain || host.endsWith(`.${domain}`))) return key;
+  }
+  return 'generic';
+}
+
+/**
+ * Turns any ATS URL - a board page, a single posting, a search result - into the
+ * board it belongs to. This is what makes discovery work: one hit on
+ * `jobs.lever.co/acme/1234-uuid` teaches the engine about Acme's whole board.
+ *
+ * @param {string} url
+ * @returns {{platform:string, slug:string, boardUrl:string, company:string}|null}
+ */
+function parseBoardUrl(url) {
+  const platform = detectAts(url);
+  if (platform === 'generic') return null;
+
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+
+  const spec = ATS_PLATFORMS[platform];
+  const slug = spec.slugFrom(parsed);
+  if (!slug || !/^[a-z0-9][a-z0-9._/-]{1,120}$/i.test(slug)) return null;
+
+  // Platform-owned paths that look like a slug but are not a customer board.
+  if (RESERVED_SLUGS.has(slug.toLowerCase())) return null;
+
+  return {
+    platform,
+    slug,
+    boardUrl: spec.boardUrl(slug),
+    company: titleCase(platform === 'workday' ? slug.split('.')[0] : slug),
+  };
+}
+
+/** First path segments that belong to the ATS itself rather than to a customer. */
+const RESERVED_SLUGS = new Set([
+  'embed', 'api', 'v0', 'v1', 'jobs', 'job', 'search', 'about', 'privacy', 'terms',
+  'static', 'assets', 'favicon.ico', 'robots.txt', 'sitemap.xml', 'login', 'signup',
+  'company', 'companies', 'blog', 'help', 'support', 'legal', 'error', 'index.html',
+]);
+
+/* ------------------------------------------------------------------ */
+/* Developer job feeds                                                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Open job APIs that need no key and publish structured JSON.
+ *
+ * `kind` selects the normaliser in `services/scraper.js`. `boardsOnly` feeds do
+ * not yield postings directly - they are mined for ATS links, which is how the
+ * Hacker News "Who is hiring?" thread turns into 40 new Greenhouse boards.
+ *
+ * @type {Array<{id:string, label:string, kind:string, url:string|((q:string)=>string), boardsOnly?:boolean}>}
+ */
+const JOB_FEEDS = [
   {
-    id: 'mock-board',
-    name: 'Local Demo Job Board',
-    company: 'Acme Corp',
-    ats: 'file',
-    enabled: mockBoardEnabled(),
-    filePath: 'mock-job-board.html',
-    baseUrl: 'https://example.com',
+    id: 'remoteok',
+    label: 'RemoteOK',
+    kind: 'remoteok',
+    url: 'https://remoteok.com/api',
+  },
+  {
+    id: 'arbeitnow',
+    label: 'Arbeitnow',
+    kind: 'arbeitnow',
+    url: 'https://www.arbeitnow.com/api/job-board-api',
+  },
+  {
+    id: 'hn-whoishiring',
+    label: 'Hacker News "Who is hiring?"',
+    kind: 'hackernews',
+    url: 'https://hn.algolia.com/api/v1/search_by_date?tags=story,author_whoishiring&hitsPerPage=6',
+    boardsOnly: true,
   },
 ];
+
+/* ------------------------------------------------------------------ */
+/* Query templates                                                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Role vocabulary the extracted resume skills are combined with. These are the
+ * words job boards actually use in titles, which is what the feed filters and
+ * the Workday `searchText` parameter match on.
+ *
+ * @type {Array<string>}
+ */
+const ROLE_TERMS = [
+  'Software Engineer',
+  'Full Stack Developer',
+  'Backend Developer',
+  'Developer',
+  'Software Engineer Intern',
+  'Associate Software Engineer',
+  'Graduate Software Engineer',
+  'Mobile Developer',
+];
+
+/**
+ * Shapes for a plain search query. `{skill}` and `{role}` are substituted by
+ * `buildSearchQueries()` in `services/matcher.js`.
+ *
+ * @type {Array<string>}
+ */
+const QUERY_TEMPLATES = ['{skill} {role}', '{role} {skill}', '{skill} Engineer', '{role}'];
+
+/**
+ * Search-engine dorks aimed at one ATS host at a time.
+ *
+ * `{site}` is a host from a platform's `dorkSites`, `{skills}` is an OR-joined
+ * quoted skill list ("Node.js" OR "Flutter" OR "Spring Boot") and `{role}` a
+ * term from `ROLE_TERMS`. The point of a dork is *discovery* - each result is a
+ * career page belonging to a company the database has never seen.
+ *
+ * @type {Array<string>}
+ */
+const DORK_TEMPLATES = [
+  'site:{site} {skills}',
+  'site:{site} {skills} "{role}"',
+  'site:{site} "{role}" {skills}',
+];
+
+/**
+ * Builds the dork list for one run.
+ *
+ * Skills are batched into OR-groups rather than issued one per query: a search
+ * engine will happily answer `"Node.js" OR "Flutter" OR "Spring Boot"` in a
+ * single request, and issuing one query per skill per site is what gets a
+ * crawler rate-limited.
+ *
+ * When the candidate's country is known it is added to every other dork. An
+ * open crawl otherwise discovers whatever is loudest on the web - which is US
+ * startups - and the location gate in `services/relevance.js` then rejects all
+ * of it, so the run spends its whole budget finding jobs its own user cannot
+ * take.
+ *
+ * @param {{skills?:Array<string>, roles?:Array<string>, locations?:Array<string>, platforms?:Array<string>, limit?:number, groupSize?:number}} options
+ * @returns {Array<string>} dork strings
+ */
+function buildDorks(options = {}) {
+  const skills = (options.skills || []).filter(Boolean);
+  const roles = options.roles && options.roles.length ? options.roles : ROLE_TERMS;
+  const platforms = options.platforms && options.platforms.length ? options.platforms : Object.keys(ATS_PLATFORMS);
+  const locations = (options.locations || []).filter(Boolean);
+  const groupSize = Math.max(1, options.groupSize || 3);
+  const limit = Math.max(1, options.limit || 12);
+
+  const sites = platforms.flatMap((key) => ATS_PLATFORMS[key]?.dorkSites || []);
+  if (!sites.length) return [];
+
+  // Skills in groups of `groupSize`, quoted so a multi-word skill stays one term.
+  const groups = [];
+  for (let i = 0; i < skills.length; i += groupSize) {
+    const group = skills.slice(i, i + groupSize).map((skill) => `"${skill}"`);
+    if (group.length) groups.push(group.join(' OR '));
+  }
+  if (!groups.length) groups.push('"Software Engineer"');
+
+  const dorks = [];
+  // Round-robin over sites first: covering four platforms shallowly beats
+  // exhausting one before the query budget runs out.
+  for (let round = 0; dorks.length < limit && round < groups.length * DORK_TEMPLATES.length; round += 1) {
+    for (const site of sites) {
+      if (dorks.length >= limit) break;
+      const template = DORK_TEMPLATES[round % DORK_TEMPLATES.length];
+      // Every other dork carries the candidate's country, so the discovered set
+      // is a mix of "anywhere" and "somewhere they can be hired".
+      const place = locations.length && dorks.length % 2 === 1 ? ` ${locations[round % locations.length]}` : '';
+      const dork = `${template
+        .replace('{site}', site)
+        .replace('{skills}', groups[round % groups.length])
+        .replace('{role}', roles[round % roles.length])}${place}`;
+      if (!dorks.includes(dork)) dorks.push(dork);
+    }
+  }
+
+  return dorks.slice(0, limit);
+}
+
+/* ------------------------------------------------------------------ */
+/* Search engines                                                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Result pages a dork can be issued against, in the order they are tried.
+ *
+ * All of these serve plain server-side markup with the result URLs in the
+ * response body, so a query works whether it went through Chromium or a bare
+ * fetch. The order is measured rather than assumed:
+ *
+ *   brave       honours `site:` fully and returns ~20 boards per dork, but
+ *               answers 429 to roughly every other rapid query.
+ *   duckduckgo  reliable until a burst, then HTTP 202 and an interstitial.
+ *   mojeek      independent index, so it is up when the others are throttling;
+ *               it is small, so it often has nothing for a narrow dork.
+ *
+ * Google and Bing are deliberately absent. Both answer a plain client with a
+ * JavaScript shell that contains the query and no organic results (Bing also
+ * base64-wraps the few links it does emit), so every request to them cost a page
+ * load, produced zero boards, and filled the log with navigation errors.
+ *
+ * No single engine is dependable, which is the reason `runDork` rotates through
+ * them and remembers which ones have started refusing.
+ *
+ * @type {Array<{id:string, url:(query:string)=>string}>}
+ */
+const SEARCH_ENGINES = [
+  { id: 'brave', url: (query) => `https://search.brave.com/search?q=${encodeURIComponent(query)}` },
+  { id: 'duckduckgo-html', url: (query) => `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}` },
+  { id: 'duckduckgo-lite', url: (query) => `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}` },
+  { id: 'mojeek', url: (query) => `https://www.mojeek.com/search?q=${encodeURIComponent(query)}` },
+];
+
+/**
+ * The engines to use this run, honouring the SEARCH_ENGINE override.
+ * @returns {Array<{id:string, url:(query:string)=>string}>}
+ */
+function getSearchEngines() {
+  const wanted = (process.env.SEARCH_ENGINE || '')
+    .split(',')
+    .map((id) => id.trim().toLowerCase())
+    .filter(Boolean);
+
+  if (!wanted.length) return SEARCH_ENGINES;
+  const chosen = SEARCH_ENGINES.filter((engine) => wanted.includes(engine.id));
+  return chosen.length ? chosen : SEARCH_ENGINES;
+}
+
+/* ------------------------------------------------------------------ */
+/* Discovery channels                                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The three ways a run finds work. Reported by `GET /api/status` in place of
+ * the old static source list, and switchable with `ENABLED_CHANNELS`.
+ *
+ * @type {Array<{id:string, name:string, description:string}>}
+ */
+const CHANNELS = [
+  {
+    id: 'ats-api',
+    name: 'ATS search APIs',
+    description: 'Greenhouse, Lever, Ashby and Workday public job endpoints for every discovered board.',
+  },
+  {
+    id: 'job-feeds',
+    name: 'Developer job feeds',
+    description: 'RemoteOK, Arbeitnow and the Hacker News "Who is hiring?" thread, filtered by resume skills.',
+  },
+  {
+    id: 'search-crawl',
+    name: 'Search-engine crawling',
+    description: 'Puppeteer runs ATS dorks against DuckDuckGo to discover career pages nobody configured.',
+  },
+];
+
+/**
+ * Channels enabled for this run.
+ * @returns {Array<{id:string, name:string, description:string}>}
+ */
+function getEnabledChannels() {
+  const override = (process.env.ENABLED_CHANNELS || '')
+    .split(',')
+    .map((id) => id.trim().toLowerCase())
+    .filter(Boolean);
+
+  if (!override.length) return CHANNELS;
+
+  const known = new Set(CHANNELS.map((channel) => channel.id));
+  override
+    .filter((id) => !known.has(id))
+    .forEach((id) => console.warn(`[sources] Unknown channel in ENABLED_CHANNELS: "${id}"`));
+
+  return CHANNELS.filter((channel) => override.includes(channel.id));
+}
+
+/** Whether a channel should run. @param {string} id @returns {boolean} */
+const isChannelEnabled = (id) => getEnabledChannels().some((channel) => channel.id === id);
 
 /* ------------------------------------------------------------------ */
 /* ATS selector profiles                                               */
 /* ------------------------------------------------------------------ */
 
 /**
- * Selector contract:
- *   card            repeated element wrapping one posting (required)
- *   title           job title, relative to `card`
- *   company         employer name, relative to `card` (optional - the board
- *                   slug is authoritative for single-company career pages)
- *   description     short summary shown on the list page
- *   link            anchor carrying the apply URL
- *   waitForSelector selector Puppeteer waits for before reading the DOM
- *   detail          selector for the description on an individual job page
+ * Selectors for the HTML paths that survive: a board whose API answered 404 and
+ * has to be read from the page, and the detail page of a posting whose feed
+ * entry carried no description.
  *
- * Field selectors may be an **array**, which `parseHtml` treats as an ordered
- * preference list: the first selector that matches wins. That matters on boards
- * whose card is `<a><p class="title">..</p><p class="location">..</p></a>` - a
- * comma-grouped string would match the wrapping anchor first and pull the
- * location into the title.
+ * Selector contract:
+ *   card / title / company / location / description / link
+ *     - a string, or an **array** treated by `parseHtml` as an ordered
+ *       preference list (the first selector that matches wins).
+ *   waitForSelector  what Puppeteer waits for before reading the DOM
+ *   detail           the description container on an individual job page
  */
 const ATS_PROFILES = {
   greenhouse: {
@@ -192,8 +491,6 @@ const ATS_PROFILES = {
     selectors: {
       card: ['tr.job-post', '.opening'],
       title: ['p.body--medium', '.opening a', 'a'],
-      // Greenhouse's second metadata line is the office, which is where the
-      // country comes from - see the location gate in services/relevance.js.
       location: ['p.body--metadata', '.location'],
       description: ['p.body--metadata', '.location'],
       link: ['a'],
@@ -218,7 +515,6 @@ const ATS_PROFILES = {
 
   ashby: {
     label: 'Ashby',
-    // Ashby renders its board client-side, so the wait matters here.
     waitForSelector: 'a[href*="/"], .ashby-job-posting-brief-list',
     selectors: {
       card: ['.ashby-job-posting-brief-list a', 'a[href*="/jobs/"]'],
@@ -231,20 +527,22 @@ const ATS_PROFILES = {
     jobUrlPattern: /\/[0-9a-f]{8}-[0-9a-f]{4}-/i,
   },
 
-  file: {
-    label: 'Local file',
+  workday: {
+    label: 'Workday',
+    waitForSelector: '[data-automation-id="jobTitle"]',
     selectors: {
-      card: '.job-listing',
-      title: '.job-title',
-      company: '.company-name',
-      description: '.job-description',
-      date: '.date-posted',
-      link: '.apply-btn',
+      card: ['li.css-1q2dra3', '[data-automation-id="jobResults"] li'],
+      title: ['[data-automation-id="jobTitle"]', 'a'],
+      location: ['[data-automation-id="locations"]'],
+      description: ['[data-automation-id="locations"]'],
+      link: ['a'],
     },
+    detail: '[data-automation-id="jobPostingDescription"], main',
+    jobUrlPattern: /\/job\//i,
   },
 
   generic: {
-    label: 'Generic career page',
+    label: 'Career page',
     waitForSelector: null,
     selectors: {
       card: ['[class*="job"]', '[class*="posting"]', '[class*="opening"]'],
@@ -262,197 +560,54 @@ const ATS_PROFILES = {
 /* ------------------------------------------------------------------ */
 
 /**
- * Strips punctuation/spacing and lowercases so "Acme Corp." === "acme corp".
- * @param {unknown} name
- * @returns {string}
- */
-function normalizeCompany(name) {
-  return String(name || '')
-    .toLowerCase()
-    .replace(/\b(inc|llc|ltd|corp|corporation|co|gmbh|plc|limited)\b/g, '')
-    .replace(/[^a-z0-9]+/g, '')
-    .trim();
-}
-
-/**
- * The active allow-list, honouring the TRUSTED_COMPANIES env override.
- * @returns {Array<string>}
- */
-function getTrustedCompanies() {
-  const override = (process.env.TRUSTED_COMPANIES || '')
-    .split(',')
-    .map((name) => name.trim())
-    .filter(Boolean);
-  if (override.length) return override;
-
-  // Every company that owns a configured board is trusted by definition: the
-  // whole point of scraping `job-boards.greenhouse.io/<slug>` is that it is that
-  // employer's own careers page. Requiring the name to *also* appear in
-  // TRUSTED_COMPANIES meant adding a board silently produced zero postings until
-  // someone remembered to edit a second list.
-  const fromSources = SOURCE_URLS.map((url) => SOURCE_OVERRIDES[url]?.company || titleCase(identify(url).slug));
-
-  const names = new Set([...TRUSTED_COMPANIES, ...fromSources]);
-  if (mockBoardEnabled()) DEMO_COMPANIES.forEach((name) => names.add(name));
-
-  return [...names];
-}
-
-/** Pre-computed lookup, rebuilt on every call so env changes are picked up. */
-function trustedIndex() {
-  return new Map(getTrustedCompanies().map((name) => [normalizeCompany(name), name]));
-}
-
-/**
- * Whether a scraped employer is on the allow-list.
- *
- * @param {string} company employer name as scraped
- * @returns {boolean}
- */
-function isTrustedCompany(company) {
-  const key = normalizeCompany(company);
-  if (!key) return false;
-  return trustedIndex().has(key);
-}
-
-/**
- * Canonical spelling for a trusted employer ("figma" -> "Figma"), so the
- * dashboard shows one consistent name per company.
- *
- * @param {string} company
- * @returns {string|null} canonical name, or null when not trusted
- */
-function canonicalCompany(company) {
-  return trustedIndex().get(normalizeCompany(company)) || null;
-}
-
-/**
- * Picks the ATS profile for a URL from its hostname.
- * @param {string} url
- * @returns {string} profile key
- */
-function detectAts(url) {
-  const host = (() => {
-    try {
-      return new URL(url).hostname.toLowerCase();
-    } catch {
-      return '';
-    }
-  })();
-
-  if (host.includes('greenhouse.io')) return 'greenhouse';
-  if (host.includes('lever.co')) return 'lever';
-  if (host.includes('ashbyhq.com')) return 'ashby';
-  return 'generic';
-}
-
-/**
- * Derives a stable source id and a human name from a board URL.
- * @param {string} url
- * @returns {{id:string, slug:string}}
- */
-function identify(url) {
-  let slug = '';
-  try {
-    const parsed = new URL(url);
-    slug = parsed.pathname.split('/').filter(Boolean).pop() || parsed.hostname.split('.')[0];
-  } catch {
-    slug = 'source';
-  }
-  const ats = detectAts(url);
-  return { id: `${ats}-${slug}`.toLowerCase(), slug };
-}
-
-/**
- * Turns a slug into a display name ("acme-corp" -> "Acme Corp").
+ * Turns a slug into a display name ("hevo-data" -> "Hevo Data").
  * @param {string} slug
  * @returns {string}
  */
 function titleCase(slug) {
   return String(slug)
-    .split(/[-_]/)
+    .split(/[-_.\s]/)
     .filter(Boolean)
-    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .map((word) => (word.length <= 3 ? word.toUpperCase() : word.charAt(0).toUpperCase() + word.slice(1)))
     .join(' ');
 }
 
 /**
- * Expands `SOURCE_URLS` (plus the local board) into full source definitions.
- *
- * @returns {Array<{id:string,name:string,company:string,url?:string,filePath?:string,ats:string,selectors:object,waitForSelector:?string,detail:?string,baseUrl:string,enabled:boolean}>}
+ * The selector profile for a URL, used by the HTML fallback paths.
+ * @param {string} url
+ * @returns {object}
  */
-function buildSources() {
-  const remote = SOURCE_URLS.map((url) => {
-    const override = SOURCE_OVERRIDES[url] || {};
-    const { id, slug } = identify(url);
-    const ats = override.ats || detectAts(url);
-    const profile = ATS_PROFILES[ats] || ATS_PROFILES.generic;
-    const company = override.company || titleCase(slug);
-
-    return {
-      id: override.id || id,
-      name: override.name || `${company} (${profile.label})`,
-      company,
-      url,
-      ats,
-      selectors: override.selectors || profile.selectors,
-      waitForSelector: override.waitForSelector ?? profile.waitForSelector ?? null,
-      detail: override.detail || profile.detail || null,
-      jobUrlPattern: profile.jobUrlPattern || null,
-      baseUrl: override.baseUrl || new URL(url).origin,
-      enabled: override.enabled !== false,
-      maxJobs: override.maxJobs ?? Number(process.env.MAX_JOBS_PER_SOURCE || 12),
-    };
-  });
-
-  const local = LOCAL_SOURCES.map((source) => {
-    const profile = ATS_PROFILES[source.ats] || ATS_PROFILES.generic;
-    return {
-      jobUrlPattern: null,
-      detail: null,
-      waitForSelector: null,
-      maxJobs: Number(process.env.MAX_JOBS_PER_SOURCE || 12),
-      selectors: profile.selectors,
-      ...source,
-      name: source.name || titleCase(source.id),
-    };
-  });
-
-  return [...local, ...remote];
-}
-
-/**
- * Sources that should actually run, honouring `ENABLED_SOURCES`.
- * @returns {Array<object>}
- */
-function getEnabledSources() {
-  const sources = buildSources();
-  const override = (process.env.ENABLED_SOURCES || '')
-    .split(',')
-    .map((id) => id.trim())
-    .filter(Boolean);
-
-  if (override.length > 0) {
-    const known = new Set(sources.map((source) => source.id));
-    override
-      .filter((id) => !known.has(id))
-      .forEach((id) => console.warn(`[sources] Unknown source id in ENABLED_SOURCES: "${id}"`));
-    return sources.filter((source) => override.includes(source.id));
-  }
-
-  return sources.filter((source) => source.enabled);
+function profileFor(url) {
+  return ATS_PROFILES[detectAts(url)] || ATS_PROFILES.generic;
 }
 
 module.exports = {
-  SOURCE_URLS,
-  TRUSTED_COMPANIES,
-  DEMO_COMPANIES,
-  ATS_PROFILES,
-  buildSources,
-  getEnabledSources,
-  getTrustedCompanies,
-  isTrustedCompany,
-  canonicalCompany,
-  normalizeCompany,
+  // trusted domains
+  ATS_DOMAINS,
+  FEED_DOMAINS,
+  getTrustedDomains,
+  isTrustedJobUrl,
+  // ATS search patterns
+  ATS_PLATFORMS,
+  workdayEndpoint,
   detectAts,
+  parseBoardUrl,
+  // feeds
+  JOB_FEEDS,
+  // query templates
+  ROLE_TERMS,
+  QUERY_TEMPLATES,
+  DORK_TEMPLATES,
+  buildDorks,
+  SEARCH_ENGINES,
+  getSearchEngines,
+  // channels
+  CHANNELS,
+  getEnabledChannels,
+  isChannelEnabled,
+  // html fallback
+  ATS_PROFILES,
+  profileFor,
+  // helpers
+  titleCase,
 };
