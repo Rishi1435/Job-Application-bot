@@ -74,6 +74,13 @@ const MAX_DELAY_MS = Number(process.env.SCRAPER_MAX_DELAY_MS || 2200);
 const MAX_BOARDS = Number(process.env.SCRAPER_MAX_BOARDS || 40);
 /** Postings kept per board after the skill filter. */
 const MAX_JOBS_PER_BOARD = Number(process.env.MAX_JOBS_PER_SOURCE || 8);
+/**
+ * Postings kept per employer across a whole run, counted by company name rather
+ * than by board so the feeds and the ATS channel share one tally. Breadth is
+ * the point of the crawl: five roles at one company is a fair sample of it, and
+ * everything after that is budget not spent on a company you have not seen.
+ */
+const MAX_PER_COMPANY = Number(process.env.SCRAPER_MAX_PER_COMPANY || 5);
 /** Ceiling on postings handed to the matcher in one run. */
 const MAX_NEW_JOBS = Number(process.env.SCRAPER_MAX_NEW_JOBS || 150);
 /** Share of that ceiling reserved for the job feeds, so the ATS channel cannot eat the run. */
@@ -986,12 +993,17 @@ function locationFilter(countries) {
  * location they can work from, and a URL neither this run nor the database has
  * seen.
  *
+ * A `perCompany` tally shared across the whole run caps how much of one
+ * employer a single crawl may take. A large board can easily offer 25 matching
+ * postings, and without this the run comes back looking like a crawl of one
+ * company - which is what the old static source list produced.
+ *
  * @param {Array<object>} jobs
- * @param {{matches:(job:object)=>Array<string>, knownUrls:Set<string>, seen:Set<string>, eligible?:(job:object)=>boolean, limit?:number}} context
- * @returns {{kept:Array<object>, skipped:{untrusted:number, offStack:number, duplicate:number, elsewhere:number}}}
+ * @param {{matches:(job:object)=>Array<string>, knownUrls:Set<string>, seen:Set<string>, eligible?:(job:object)=>boolean, limit?:number, perCompany?:Map<string,number>}} context
+ * @returns {{kept:Array<object>, skipped:{untrusted:number, offStack:number, duplicate:number, elsewhere:number, crowded:number}}}
  */
 function filterJobs(jobs, context) {
-  const skipped = { untrusted: 0, offStack: 0, duplicate: 0, elsewhere: 0 };
+  const skipped = { untrusted: 0, offStack: 0, duplicate: 0, elsewhere: 0, crowded: 0 };
   const kept = [];
 
   for (const job of jobs) {
@@ -1016,6 +1028,16 @@ function filterJobs(jobs, context) {
     if (context.eligible && !context.eligible(job)) {
       skipped.elsewhere += 1;
       continue;
+    }
+
+    const employer = String(job.company || '').toLowerCase();
+    if (context.perCompany && employer) {
+      const taken = context.perCompany.get(employer) || 0;
+      if (taken >= MAX_PER_COMPANY) {
+        skipped.crowded += 1;
+        continue;
+      }
+      context.perCompany.set(employer, taken + 1);
     }
 
     context.seen.add(job.applyUrl);
@@ -1063,7 +1085,9 @@ async function collectJobs(options = {}) {
     offStack: 0,
     elsewhere: 0,
     duplicates: 0,
+    crowded: 0,
     companies: new Set(),
+    perCompany: new Map(),
   };
 
   let browser = options.browser || null;
@@ -1120,12 +1144,14 @@ async function collectJobs(options = {}) {
         eligible,
         knownUrls,
         seen,
+        perCompany: stats.perCompany,
         limit: Math.max(1, Math.round(MAX_NEW_JOBS * FEED_SHARE)),
       });
       stats.untrusted += skipped.untrusted;
       stats.offStack += skipped.offStack;
       stats.elsewhere += skipped.elsewhere;
       stats.duplicates += skipped.duplicate;
+      stats.crowded += skipped.crowded;
       stats.fromFeeds = kept.length;
       kept.forEach((job) => stats.companies.add(job.company));
       jobs.push(...kept);
@@ -1151,6 +1177,7 @@ async function collectJobs(options = {}) {
             eligible,
             knownUrls,
             seen,
+            perCompany: stats.perCompany,
             // The run's remaining budget, not just the per-board cap: the loop
             // only checks `MAX_NEW_JOBS` between boards, so without this the
             // last board can push the batch a whole board over the ceiling.
@@ -1160,6 +1187,7 @@ async function collectJobs(options = {}) {
           stats.offStack += skipped.offStack;
           stats.elsewhere += skipped.elsewhere;
           stats.duplicates += skipped.duplicate;
+          stats.crowded += skipped.crowded;
 
           if (!ok) {
             stats.boardsRetired += 1;
@@ -1191,7 +1219,14 @@ async function collectJobs(options = {}) {
           if (jobs.length >= MAX_NEW_JOBS) break;
           try {
             const found = await fetchBoardViaHtml(browser, board);
-            const { kept } = filterJobs(found, { matches, eligible, knownUrls, seen, limit: MAX_JOBS_PER_BOARD });
+            const { kept } = filterJobs(found, {
+              matches,
+              eligible,
+              knownUrls,
+              seen,
+              perCompany: stats.perCompany,
+              limit: MAX_JOBS_PER_BOARD,
+            });
             if (kept.length) {
               jobs.push(...kept);
               stats.fromAts += kept.length;
@@ -1217,6 +1252,7 @@ async function collectJobs(options = {}) {
   }
 
   stats.companies = [...stats.companies];
+  delete stats.perCompany; // a run tally, not a result worth reporting
   return { jobs, errors, stats };
 }
 
@@ -1399,7 +1435,8 @@ async function runScraper(options = {}) {
       `[scraper] ${collected.jobs.length} new posting(s) from ${collected.stats.companies.length} compan(ies) - ` +
         `${collected.stats.fromAts} via ATS APIs, ${collected.stats.fromFeeds} via feeds; ` +
         `skipped ${collected.stats.duplicates} already seen, ${collected.stats.offStack} off-stack, ` +
-        `${collected.stats.elsewhere} in another country, ${collected.stats.untrusted} untrusted.`
+        `${collected.stats.elsewhere} in another country, ${collected.stats.crowded} over the per-company cap, ` +
+        `${collected.stats.untrusted} untrusted.`
     );
 
     for (const userId of userIds) {

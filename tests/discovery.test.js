@@ -183,6 +183,36 @@ test('filterJobs drops untrusted domains, off-stack roles and anything already s
   assert.equal(skipped.duplicate, 2, 'one already in the database, one repeated in the batch');
 });
 
+test('filterJobs caps how much of one employer a run takes', () => {
+  const jobs = Array.from({ length: 9 }, (_, i) => ({
+    title: `Node.js Engineer ${i}`,
+    company: i < 7 ? 'Bigcorp' : 'Smallcorp',
+    applyUrl: `https://jobs.lever.co/acme/${i}`,
+    description: 'Node.js',
+  }));
+
+  const perCompany = new Map();
+  const { kept, skipped } = filterJobs(jobs, {
+    matches: termMatcher(['Node.js']),
+    knownUrls: new Set(),
+    seen: new Set(),
+    perCompany,
+  });
+
+  const fromBigcorp = kept.filter((job) => job.company === 'Bigcorp');
+  assert.ok(fromBigcorp.length <= 5, `one employer took ${fromBigcorp.length} slots`);
+  assert.equal(skipped.crowded, 7 - fromBigcorp.length);
+  assert.equal(kept.filter((job) => job.company === 'Smallcorp').length, 2, 'the cap is per employer, not per batch');
+
+  // The tally is the run's, so a second board cannot restart the same employer.
+  const second = filterJobs(
+    [{ title: 'Node.js Lead', company: 'Bigcorp', applyUrl: 'https://jobs.lever.co/acme/99', description: 'Node.js' }],
+    { matches: termMatcher(['Node.js']), knownUrls: new Set(), seen: new Set(), perCompany }
+  );
+  assert.equal(second.kept.length, 0);
+  assert.equal(second.skipped.crowded, 1);
+});
+
 test('htmlToText unwraps the escaped markup Greenhouse ships', () => {
   assert.equal(htmlToText('&lt;p&gt;We use &lt;b&gt;Node.js&lt;/b&gt;&lt;/p&gt;'), 'We use Node.js');
   assert.equal(htmlToText('<div><p>Plain  HTML</p></div>'), 'Plain HTML');

@@ -21,11 +21,44 @@ const { Pool } = require('pg');
 
 const CONNECTION_STRING = process.env.DATABASE_URL || process.env.POSTGRES_URL || '';
 
+// Read here rather than importing it from the matcher: the matcher already
+// imports this module, and a cycle would leave the constant undefined.
+const MIN_MATCH_SCORE = Number(process.env.MIN_MATCH_SCORE || 50);
+
+/**
+ * Whether a database host is reachable only from inside a private network.
+ *
+ * Two shapes count. A private or loopback IP literal is obvious. The subtler one
+ * is a single-label hostname - `db`, `postgres`, or the `dpg-cvab12...-a` that
+ * Render's *internal* connection string uses: a name with no dot cannot be a
+ * public DNS name, so it can only resolve on a private network.
+ *
+ * @param {string} host
+ * @returns {boolean}
+ */
+function isPrivateHost(host) {
+  if (!host) return false;
+  if (/^(localhost|host\.docker\.internal)$/i.test(host)) return true;
+  if (/\.(internal|local|localdomain)$/i.test(host)) return true;
+
+  // 10/8, 172.16/12, 192.168/16, 127/8 - the RFC 1918 and loopback ranges.
+  const ipv4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4) {
+    const [a, b] = [Number(ipv4[1]), Number(ipv4[2])];
+    return a === 10 || a === 127 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+  }
+  if (host === '::1') return true;
+
+  return !host.includes('.');
+}
+
 /**
  * Render's managed Postgres terminates TLS with a certificate the Node client
  * does not trust out of the box, so external connections need
  * `rejectUnauthorized: false`. Internal connections (and local Docker) do not
- * use TLS at all. Force either way with DATABASE_SSL=true|false.
+ * offer TLS at all, and asking for it there is not a downgrade but an outright
+ * failure to boot: "The server does not support SSL connections". Force either
+ * way with DATABASE_SSL=true|false.
  *
  * @returns {false|{rejectUnauthorized:boolean}}
  */
@@ -34,9 +67,17 @@ function resolveSsl() {
   if (explicit === 'true') return { rejectUnauthorized: false };
   if (explicit === 'false') return false;
 
+  if (!CONNECTION_STRING) return false;
   if (/sslmode=disable/i.test(CONNECTION_STRING)) return false;
-  if (/localhost|127\.0\.0\.1|\.internal|host\.docker\.internal/i.test(CONNECTION_STRING)) return false;
-  return CONNECTION_STRING ? { rejectUnauthorized: false } : false;
+
+  try {
+    if (isPrivateHost(new URL(CONNECTION_STRING).hostname)) return false;
+  } catch {
+    // Not a parseable URL (a libpq keyword string, say) - fall through to the
+    // safe default of asking for TLS.
+  }
+
+  return { rejectUnauthorized: false };
 }
 
 const pool = new Pool({
@@ -421,6 +462,12 @@ async function updateJobMatchData(userId, jobId, matchData) {
  * candidate) are hidden the same way and for the same reason: kept for auditing,
  * excluded from the board unless `includeMismatch` is passed.
  *
+ * Weak matches are excluded the same way. The write path stopped storing them
+ * when MIN_MATCH_SCORE arrived, but rows written before that are still in the
+ * table - and a database that has been crawled for a while is mostly those.
+ * Reading applies the floor too, so lowering the bar or importing older rows
+ * cannot flood the board. Pass `minScore: 0` to audit everything.
+ *
  * @param {number} userId
  * @param {{jobType?:string, minScore?:number, search?:string, limit?:number, includeBelowBar?:boolean, includeMismatch?:boolean}} [options]
  * @returns {Promise<Array<object>>}
@@ -428,6 +475,7 @@ async function updateJobMatchData(userId, jobId, matchData) {
 async function getJobs(userId, options = {}) {
   const params = [userId];
   const clauses = ['user_id = $1'];
+  const floor = Number.isFinite(options.minScore) ? options.minScore : MIN_MATCH_SCORE;
 
   if (!options.includeBelowBar) {
     clauses.push(`(match_data->>'meets_pay_bar')::boolean IS NOT FALSE`);
@@ -444,8 +492,8 @@ async function getJobs(userId, options = {}) {
     clauses.push(`match_data->>'job_type' = $${params.length}`);
   }
 
-  if (Number.isFinite(options.minScore)) {
-    params.push(options.minScore);
+  if (floor > 0) {
+    params.push(floor);
     clauses.push(`COALESCE((match_data->>'score')::numeric, 0) >= $${params.length}`);
   }
 
@@ -505,6 +553,7 @@ async function getStats(userId) {
         WHERE user_id = $1
           AND (match_data->>'meets_pay_bar')::boolean IS NOT FALSE
           AND COALESCE(match_data->'relevance'->>'fit', 'match') NOT IN ('mismatch', 'overreach', 'elsewhere')
+          AND COALESCE((match_data->>'score')::numeric, 0) >= $2
      )
      SELECT (SELECT COUNT(*) FROM recommended)::int                                                     AS total,
             (SELECT COUNT(*) FROM recommended WHERE match_data->>'job_type' = 'Internship')::int        AS internships,
@@ -516,8 +565,10 @@ async function getStats(userId) {
             (SELECT COUNT(*) FROM jobs
               WHERE user_id = $1
                 AND match_data->'relevance'->>'fit' IN ('mismatch', 'overreach', 'elsewhere'))::int                  AS filtered_out,
+            (SELECT COUNT(*) FROM jobs
+              WHERE user_id = $1 AND COALESCE((match_data->>'score')::numeric, 0) < $2)::int            AS below_match_bar,
             (SELECT MAX(updated_at) FROM jobs WHERE user_id = $1)                                       AS last_updated_at`,
-    [userId]
+    [userId, MIN_MATCH_SCORE]
   );
 
   const row = rows[0] || {};
@@ -528,6 +579,7 @@ async function getStats(userId) {
     strongMatches: row.strong_matches || 0,
     averageScore: row.average_score === null || row.average_score === undefined ? null : Number(row.average_score),
     belowPayBar: row.below_pay_bar || 0,
+    belowMatchBar: row.below_match_bar || 0,
     filteredOut: row.filtered_out || 0,
     lastUpdatedAt: row.last_updated_at || null,
   };

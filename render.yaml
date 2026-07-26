@@ -1,0 +1,69 @@
+# Render Blueprint: PostgreSQL + the web service, wired together.
+#
+# Render reads this when you create a Blueprint from the repo, so the database,
+# the connection string and the environment are set up in one step instead of
+# twenty form fields. Values that must stay secret are marked `sync: false` -
+# Render prompts for them at deploy time and never stores them in git.
+#
+# The defaults here are the ones that work on the free instance type:
+#   - `search-crawl` is off, so Chromium never launches. It is the only channel
+#     that needs a browser, and 512 MB is not enough to run one reliably next to
+#     Node. The ATS APIs supply most of the postings anyway (44 of 48 on the last
+#     verification run).
+#   - The cron schedule is every 6 hours rather than every 30 minutes, because a
+#     free service sleeps after 15 minutes of inactivity and an in-process
+#     scheduler sleeps with it. See the README for what to change on a paid plan.
+
+databases:
+  - name: jobbot-db
+    databaseName: jobbot
+    user: jobbot
+    plan: free
+    postgresMajorVersion: "16"
+
+services:
+  - type: web
+    name: job-application-bot
+    runtime: docker
+    plan: free
+    # Closest region to India; move it nearer to you if that is not where you are.
+    region: singapore
+    branch: main
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      # Internal connection string, injected by Render. Never paste it yourself.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: jobbot-db
+          property: connectionString
+      # Generated once and kept. Rotating it logs every user out.
+      - key: JWT_SECRET
+        generateValue: true
+      # Prompted for at deploy time. Without it the app still runs, scoring
+      # postings with the local keyword fallback instead of the LLM.
+      - key: NVIDIA_API_KEY
+        sync: false
+      - key: NVIDIA_MODEL
+        value: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning
+      # Discovery channels. Add `search-crawl` once you are off the free plan.
+      - key: ENABLED_CHANNELS
+        value: ats-api,job-feeds
+      - key: CRON_SCHEDULE
+        value: 0 */6 * * *
+      - key: CRON_TIMEZONE
+        value: Asia/Kolkata
+      - key: RUN_ON_STARTUP
+        value: "false"
+      # A manual scrape from the dashboard has to answer before Render's proxy
+      # gives up on the request, so keep one run small.
+      - key: SCRAPER_MAX_BOARDS
+        value: "25"
+      - key: SCRAPER_MAX_NEW_JOBS
+        value: "60"
+      - key: MAX_JOBS_PER_SOURCE
+        value: "8"
+      - key: SCRAPER_MAX_PER_COMPANY
+        value: "5"
+      - key: MIN_MATCH_SCORE
+        value: "50"

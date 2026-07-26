@@ -498,7 +498,7 @@
         M.countUp(el.statFullTime, stats.fullTime);
         M.countUp(el.statStrong, stats.strongMatches);
         M.countUp(el.statAverage, stats.averageScore ?? 0, { decimals: 1 });
-        M.countUp(el.statFiltered, (stats.filteredOut || 0) + (stats.belowPayBar || 0));
+        M.countUp(el.statFiltered, (stats.filteredOut || 0) + (stats.belowPayBar || 0) + (stats.belowMatchBar || 0));
 
         el.payBarLabel.title = `${stats.belowPayBar} posting(s) hidden: salary under 10 LPA, or CTC under 15 LPA.`;
 

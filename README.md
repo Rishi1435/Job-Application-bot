@@ -119,10 +119,12 @@ scoring plus a regex categoriser, and says so in the match reason.
 | [public/](public/) | Dashboard (vanilla HTML/CSS/JS, dark theme) |
 | [scripts/scrape.js](scripts/scrape.js) | `npm run scrape` - CLI run, all users or one |
 | [scripts/rescreen.js](scripts/rescreen.js) | `npm run rescreen` - re-apply the gate to stored postings, no LLM calls |
+| [scripts/prune.js](scripts/prune.js) | `npm run prune` - delete rows the current bars would not have stored (dry run by default) |
 | [public/motion.js](public/motion.js) | Framer-Motion-style primitives (springs, stagger, FLIP, presence) on the Web Animations API |
 | [tests/verify.js](tests/verify.js) | `npm run verify` - live Postgres + NVIDIA checks |
 | [tests/](tests/) | `npm test` - offline node:test unit tests (units, compensation, relevance) |
 | [Dockerfile](Dockerfile) | `node:20-slim` + system Chromium, for Render |
+| [render.yaml](render.yaml) | Render Blueprint: database + web service + environment in one deploy |
 
 ## Configuration
 
@@ -142,7 +144,7 @@ list. The ones that matter most:
 | `INR_PER_USD` | `88` | FX used to convert foreign pay to LPA |
 | `TRUSTED_ATS_DOMAINS` | list in `config/sources.js` | Comma-separated domain allow-list override |
 | `ENABLED_CHANNELS` | all three | `ats-api`, `job-feeds`, `search-crawl` |
-| `MIN_MATCH_SCORE` | `50` | A posting scoring below this is never stored |
+| `MIN_MATCH_SCORE` | `50` | A posting scoring below this is never stored, and never listed |
 | `SCRAPER_MAX_BOARDS` | `40` | Boards from the registry visited per run |
 | `SCRAPER_MAX_NEW_JOBS` | `150` | Ceiling on postings handed to the matcher per run |
 | `SCRAPER_MAX_DORKS` | `6` | Search-engine queries per run |
@@ -150,7 +152,8 @@ list. The ones that matter most:
 | `SCRAPER_FEED_SHARE` | `0.25` | Share of the run's budget reserved for the job feeds |
 | `MAX_SEARCH_SKILLS` | `12` | Skills taken from the resumes to search with |
 | `SCRAPER_DETAIL_LIMIT` | `3` | Job pages opened per board for the full description |
-| `MAX_JOBS_PER_SOURCE` | `25` | Cap per board per run |
+| `MAX_JOBS_PER_SOURCE` | `8` | Cap per board per run |
+| `SCRAPER_MAX_PER_COMPANY` | `5` | Cap per employer across the whole run, counted by company name |
 | `SEARCH_ENGINE` | all four | Restrict the search crawl, e.g. `brave,duckduckgo-html` |
 | `RELEVANCE_MAX_LEVEL_STRETCH` | `1` | How many rungs above the candidate a posting may sit |
 | `CRON_SCHEDULE` | `*/30 * * * *` | Every 30 minutes, for all tenants. Any 5-field cron expression |
@@ -304,9 +307,16 @@ whose API stops answering is marked `ok = false` and stops being retried.
   `searchText`.
 - **Not already seen** - apply URLs already stored for every tenant on the run are
   dropped before any detail fetch or LLM call.
+- **Not a fifth helping of the same employer** - a run keeps at most
+  `SCRAPER_MAX_PER_COMPANY` postings per company, counted across every channel.
+  A single large board can easily offer forty matching openings, and spending the
+  run on them is how a crawl of the whole web comes back looking like a crawl of
+  one company.
 
 Only then does the LLM score the posting, and only a verdict of **50 or above**
-is written to the database (`MIN_MATCH_SCORE`).
+is written to the database (`MIN_MATCH_SCORE`). The same floor applies when the
+board is read, so rows stored under an older, lower bar do not resurface -
+`npm run prune` deletes them for good.
 
 Rate limits are real and every engine handles them differently: DuckDuckGo
 answers a burst of dorks with HTTP 202 and an interstitial that looks like a
@@ -345,19 +355,39 @@ the stored data actually changed, so scheduled results appear without a reload.
 
 ## Deploying to Render
 
-1. **Create a PostgreSQL instance** and copy its *Internal Connection String*.
-2. **New Web Service** → *Docker* runtime, pointed at this repo. The
-   [Dockerfile](Dockerfile) installs Chromium via apt and sets
-   `PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true` /
-   `PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium`.
-3. **Environment**: `DATABASE_URL`, `JWT_SECRET`, `NVIDIA_API_KEY`, and
-   `DATABASE_SSL=true` if you use the external connection string.
-4. **Health check path**: `/api/health`.
+[render.yaml](render.yaml) is a Blueprint: it declares the database, the web
+service and the wiring between them, so the deploy is *New → Blueprint*, point
+it at the repo, and paste one secret (`NVIDIA_API_KEY`) when prompted.
+`DATABASE_URL` is injected from the database and `JWT_SECRET` is generated, so
+neither is ever typed or committed.
 
-The schema is created on boot, so no migration step is needed. Puppeteer needs
-memory - the free instance type can OOM mid-render; lower
-`MAX_JOBS_PER_SOURCE` / `SCRAPER_DETAIL_LIMIT` or use a paid instance if you see
-Chromium crashes.
+Doing it by hand instead: create the PostgreSQL instance first, then a Web
+Service on the **Docker** runtime with health check path `/api/health`, and set
+`DATABASE_URL`, `JWT_SECRET` and `NVIDIA_API_KEY` yourself. The schema is created
+on boot, so there is no migration step either way.
+
+Three things about the free instance type are worth knowing before you pick it:
+
+- **It sleeps after 15 minutes of inactivity, and the scheduler sleeps with it.**
+  The cron job runs *inside* the web process ([server.js](server.js)), so a
+  sleeping service scrapes nothing and wakes on the next HTTP request. Opening the
+  dashboard and pressing *Run scrape* still works, which is the free-tier
+  workflow. For an unattended schedule, use a paid instance, or move the scrape
+  to a separate Render Cron Job running `npm run scrape`.
+- **512 MB is not enough for Chromium.** The `search-crawl` channel is the only
+  one that launches a browser, so `ENABLED_CHANNELS=ats-api,job-feeds` keeps the
+  service inside its memory budget - at the cost of discovering fewer new boards.
+  The Blueprint sets this. Turn `search-crawl` back on when you upgrade.
+- **A manual scrape has to answer before Render's proxy times the request out.**
+  Keep `SCRAPER_MAX_BOARDS` modest (the Blueprint uses 25). The run continues
+  server-side even if the request gives up, but the dashboard will not show its
+  summary.
+
+TLS is negotiated from the connection string's host: Render's *internal* string
+is a single-label name (`dpg-...-a`) whose Postgres does not offer TLS, while the
+*external* string is a public `.render.com` name that requires it. Both are
+handled automatically; `DATABASE_SSL=true|false` overrides the guess if you ever
+need it.
 
 ## Tests
 

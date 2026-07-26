@@ -157,7 +157,7 @@ async function rescore(userIds) {
     console.log(`Boards       : ${boards.total} known (${boards.healthy} healthy), ${summary.discovery?.boardsNew ?? 0} discovered this run`);
     console.log(`             : ${Object.entries(boards.byPlatform).map(([key, count]) => `${key} ${count}`).join(', ')}`);
     console.log(`Postings     : ${summary.found} new and skill-matched, from ${summary.discovery?.companies?.length ?? 0} compan(ies)`);
-    console.log(`Filtered     : ${summary.discovery?.duplicates ?? 0} already seen, ${summary.discovery?.offStack ?? 0} off-stack, ${summary.discovery?.elsewhere ?? 0} wrong country, ${summary.discovery?.untrusted ?? 0} untrusted domain`);
+    console.log(`Filtered     : ${summary.discovery?.duplicates ?? 0} already seen, ${summary.discovery?.offStack ?? 0} off-stack, ${summary.discovery?.elsewhere ?? 0} wrong country, ${summary.discovery?.crowded ?? 0} over the per-company cap, ${summary.discovery?.untrusted ?? 0} untrusted domain`);
     console.log(`Stored       : ${summary.inserted} new, ${summary.belowBar} below the match bar`);
     console.log(`LLM scored   : ${summary.scored}`);
     console.log(`Users        : ${summary.users}`);

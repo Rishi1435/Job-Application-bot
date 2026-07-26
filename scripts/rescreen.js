@@ -69,7 +69,10 @@ function isUnreachable(url) {
  */
 async function rescreenUser(user, options) {
   const resumes = await db.getResumes(user.id);
-  const jobs = await db.getJobs(user.id, { includeBelowBar: true, includeMismatch: true });
+  // `minScore: 0` because this is an audit pass: weak rows are exactly the ones
+  // whose stored verdict is most likely to be stale, and the read path hides
+  // them from the board by default.
+  const jobs = await db.getJobs(user.id, { includeBelowBar: true, includeMismatch: true, minScore: 0 });
   const summary = { screened: 0, changed: 0, deleted: 0, relinked: 0 };
 
   console.log(`\n[user ${user.id}] ${user.username} - ${jobs.length} posting(s), ${resumes.length} resume(s)`);

@@ -9,7 +9,8 @@
     "scrape": "node scripts/scrape.js",
     "verify": "node tests/verify.js",
     "test": "node --test tests/units.test.js tests/compensation.test.js tests/relevance.test.js tests/discovery.test.js",
-    "rescreen": "node scripts/rescreen.js"
+    "rescreen": "node scripts/rescreen.js",
+    "prune": "node scripts/prune.js"
   },
   "repository": {
     "type": "git",

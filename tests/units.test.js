@@ -90,3 +90,58 @@ test('keywordScore ranks a matching stack above an unrelated one', () => {
   assert.ok(strong.score > weak.score, `${strong.score} should beat ${weak.score}`);
   assert.equal(keywordScore('').score, 0);
 });
+
+/* ------------------------------------------------------------------ */
+/* Database TLS negotiation                                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Reloads the database module under a given connection string and reports
+ * whether the pool would ask for TLS. The module reads the environment once at
+ * load, so the cache entry has to go with it.
+ *
+ * @param {string} url
+ * @param {string} [explicit] value for DATABASE_SSL
+ * @returns {boolean}
+ */
+function wouldUseTls(url, explicit) {
+  const path = require.resolve('../services/database');
+  const previous = { url: process.env.DATABASE_URL, ssl: process.env.DATABASE_SSL };
+
+  delete require.cache[path];
+  process.env.DATABASE_URL = url;
+  if (explicit === undefined) delete process.env.DATABASE_SSL;
+  else process.env.DATABASE_SSL = explicit;
+
+  const { pool } = require(path);
+  const answer = Boolean(pool.options.ssl);
+
+  delete require.cache[path];
+  if (previous.url === undefined) delete process.env.DATABASE_URL;
+  else process.env.DATABASE_URL = previous.url;
+  if (previous.ssl === undefined) delete process.env.DATABASE_SSL;
+  else process.env.DATABASE_SSL = previous.ssl;
+
+  return answer;
+}
+
+test('TLS is requested for public database hosts and skipped for private ones', () => {
+  // Render's internal connection string is a single-label host, which cannot be
+  // a public DNS name - and its Postgres does not offer TLS there. Asking for it
+  // does not downgrade, it fails the boot outright.
+  assert.equal(wouldUseTls('postgresql://u:p@dpg-cvab12345678-a/jobbot'), false, 'Render internal');
+  assert.equal(wouldUseTls('postgresql://u:p@localhost:5432/jobbot'), false, 'localhost');
+  assert.equal(wouldUseTls('postgresql://u:p@172.17.0.2:5432/jobbot'), false, 'docker bridge');
+  assert.equal(wouldUseTls('postgresql://u:p@10.1.2.3:5432/jobbot'), false, 'RFC 1918');
+
+  assert.equal(
+    wouldUseTls('postgresql://u:p@dpg-cvab12345678-a.singapore-postgres.render.com/jobbot'),
+    true,
+    'Render external'
+  );
+
+  // Explicit settings win over the guess, in both directions.
+  assert.equal(wouldUseTls('postgresql://u:p@localhost:5432/jobbot', 'true'), true);
+  assert.equal(wouldUseTls('postgresql://u:p@db.example.com:5432/jobbot', 'false'), false);
+  assert.equal(wouldUseTls('postgresql://u:p@db.example.com:5432/jobbot?sslmode=disable'), false);
+});
