@@ -370,10 +370,19 @@ Three things about the free instance type are worth knowing before you pick it:
 
 - **It sleeps after 15 minutes of inactivity, and the scheduler sleeps with it.**
   The cron job runs *inside* the web process ([server.js](server.js)), so a
-  sleeping service scrapes nothing and wakes on the next HTTP request. Opening the
-  dashboard and pressing *Run scrape* still works, which is the free-tier
-  workflow. For an unattended schedule, use a paid instance, or move the scrape
-  to a separate Render Cron Job running `npm run scrape`.
+  sleeping service scrapes nothing and wakes on the next HTTP request - the bot
+  only works while you are watching it, which is the opposite of the point. Three
+  ways out, in the order I would try them:
+  1. **Keep it awake with an external ping.** A free uptime monitor
+     (UptimeRobot, cron-job.org) requesting `/api/health` every 10 minutes keeps
+     the instance up, so the in-process cron actually fires. One service kept
+     awake around the clock is ~730 hours, which fits inside the free monthly
+     allowance with nothing to spare - so this works for *this* service only.
+  2. **A separate cron service.** Commented out in [render.yaml](render.yaml):
+     it wakes on its own schedule, runs `scripts/scrape.js` against the same
+     database and exits, needing no web service at all. Render bills these by
+     runtime.
+  3. **A paid instance**, which never sleeps and needs no workaround.
 - **512 MB is not enough for Chromium.** The `search-crawl` channel is the only
   one that launches a browser, so `ENABLED_CHANNELS=ats-api,job-feeds` keeps the
   service inside its memory budget - at the cost of discovering fewer new boards.

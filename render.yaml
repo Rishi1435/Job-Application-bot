@@ -38,11 +38,20 @@ services:
     healthCheckPath: /api/health
     autoDeploy: true
     envVars:
-      # Internal connection string, injected by Render. Never paste it yourself.
+      # Set once in the dashboard, deliberately NOT wired to the database block.
+      #
+      # `fromDatabase` looks tidier and is right when both resources were created
+      # together in one region. It is a trap otherwise: it regenerates the
+      # *internal* connection string on every blueprint sync, so if the database
+      # lives in another region - where that hostname does not resolve - a sync
+      # silently overwrites a working external URL with a broken internal one,
+      # and the next deploy dies with `getaddrinfo ENOTFOUND dpg-...-a` while the
+      # previous deploy keeps serving.
+      #
+      # Paste the database's Internal Connection String when it shares the
+      # service's region, or the External one when it does not.
       - key: DATABASE_URL
-        fromDatabase:
-          name: jobbot-db
-          property: connectionString
+        sync: false
       # Generated once and kept. Rotating it logs every user out.
       - key: JWT_SECRET
         generateValue: true
@@ -84,3 +93,33 @@ services:
         value: "5"
       - key: MIN_MATCH_SCORE
         value: "50"
+
+# Scraping on a schedule that does not depend on anyone visiting the site.
+#
+# The web service runs the cron in-process, which is enough while the instance
+# is awake - and a free instance sleeps after 15 minutes of inactivity, so in
+# practice it only scrapes while you are watching. That is the opposite of what
+# a job bot is for.
+#
+# A cron *service* has no such problem: it wakes on its own schedule, runs
+# `scripts/scrape.js` against the same database, and exits. Render bills cron
+# services by runtime, so this is left commented out rather than quietly
+# creating something chargeable. Uncomment it, set the same DATABASE_URL and
+# NVIDIA_API_KEY in the dashboard, and set CRON_SCHEDULE="" on the web service so
+# the two schedulers do not both scrape.
+#
+#  - type: cron
+#    name: jobbot-scrape
+#    runtime: docker
+#    region: singapore
+#    plan: starter
+#    branch: main
+#    schedule: "0 */6 * * *"
+#    dockerCommand: node scripts/scrape.js
+#    envVars:
+#      - key: DATABASE_URL
+#        sync: false
+#      - key: NVIDIA_API_KEY
+#        sync: false
+#      - key: SCRAPER_USE_BROWSER
+#        value: "false"

@@ -205,6 +205,37 @@ function isTransientConnectionError(error) {
 }
 
 /**
+ * Turns a connection failure into a message that names its likely cause.
+ *
+ * `getaddrinfo ENOTFOUND dpg-...-a` is the one worth spelling out: it is not a
+ * network blip but a hostname that does not exist for this container, which on a
+ * managed platform nearly always means the database is in another region, or the
+ * connection string was regenerated to point at a database that was replaced.
+ *
+ * @param {Error & {code?:string}} error
+ * @returns {Error} the same error, with a fuller message when we can give one
+ */
+function describeConnectionFailure(error) {
+  const host = (() => {
+    try {
+      return new URL(CONNECTION_STRING).hostname;
+    } catch {
+      return '';
+    }
+  })();
+
+  if (error?.code === 'ENOTFOUND' && host && !host.includes('.')) {
+    error.message =
+      `${error.message} - "${host}" is a private hostname that does not resolve from here. ` +
+      'On Render that means the database is in a different region from this service, or DATABASE_URL ' +
+      'still points at a database that has been replaced. Use the database\'s External Connection String, ' +
+      'or recreate one of the two so both sit in the same region.';
+  }
+
+  return error;
+}
+
+/**
  * Connects and creates the schema, waiting out a database that is not up yet.
  *
  * Exiting on the first failure makes a deploy fail for a condition that clears
@@ -236,7 +267,9 @@ async function initDatabase(options = {}) {
         client.release();
       }
     } catch (error) {
-      if (attempt > retries || !isTransientConnectionError(error)) throw error;
+      if (attempt > retries || !isTransientConnectionError(error)) {
+        throw describeConnectionFailure(error);
+      }
 
       console.warn(
         `[db] ${error.code || error.message} - database not reachable yet ` +
