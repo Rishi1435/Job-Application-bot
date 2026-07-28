@@ -88,6 +88,17 @@ const FEED_SHARE = Number(process.env.SCRAPER_FEED_SHARE || 0.25);
 /** Search-engine queries issued per run. Each one is a page load. */
 const MAX_DORKS = Number(process.env.SCRAPER_MAX_DORKS || 6);
 /**
+ * Whether the search channel may drive a real browser.
+ *
+ * It reads better with one - some engines answer a headless Chromium when they
+ * stonewall a bare fetch - but it does not need one: every dork falls back to
+ * plain HTTP, and the ATS and feed channels never touch a browser. On a 512 MB
+ * instance Chromium is the difference between running and being OOM-killed, so
+ * `SCRAPER_USE_BROWSER=false` keeps board discovery working there instead of
+ * forcing the whole channel off.
+ */
+const USE_BROWSER = String(process.env.SCRAPER_USE_BROWSER || 'true').toLowerCase() !== 'false';
+/**
  * Pause between search queries. Deliberately much longer than the delay between
  * board reads: an ATS API is a documented endpoint that expects traffic, while a
  * search engine starts serving throttle pages after a handful of rapid dorks.
@@ -1093,7 +1104,7 @@ async function collectJobs(options = {}) {
   let browser = options.browser || null;
   let ownsBrowser = false;
 
-  if (!browser && isChannelEnabled('search-crawl')) {
+  if (!browser && isChannelEnabled('search-crawl') && USE_BROWSER) {
     try {
       browser = await launchBrowser();
       ownsBrowser = true;

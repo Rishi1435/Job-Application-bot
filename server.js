@@ -235,13 +235,28 @@ app.delete(
 /* Scraping (protected)                                                */
 /* ------------------------------------------------------------------ */
 
-/** POST /api/scrape - run the pipeline now for the calling user. */
+/**
+ * POST /api/scrape - start a run for the calling user and answer immediately.
+ *
+ * A crawl takes minutes; a hosting proxy gives a request about one. Holding the
+ * connection open until the run finished meant the browser was shown a timeout
+ * while the scrape carried on invisibly - the worst of both. The run is now
+ * fired and left to finish, and the client follows it through `GET /api/status`
+ * (`running`, then `lastRun`), which is also what a page reload mid-run sees.
+ */
 app.post(
   '/api/scrape',
   auth.requireAuth,
   asyncRoute(async (req, res) => {
     if (isRunning()) return res.status(409).json({ error: 'A scrape is already running.' });
-    res.json(await runScraperForUser(req.user.id));
+
+    // Deliberately not awaited. `runScraperForUser` handles its own errors and
+    // records them on `lastRun`; nothing here can act on a rejection anyway.
+    runScraperForUser(req.user.id).catch((error) => {
+      console.error('[server] Manual scrape failed:', error.message);
+    });
+
+    res.status(202).json({ status: 'started' });
   })
 );
 

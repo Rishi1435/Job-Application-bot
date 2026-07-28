@@ -27,6 +27,9 @@
     const TABS = { INTERNSHIP: 'Internship', FULL_TIME: 'Full-Time Job' };
     /** How often the open dashboard checks whether the scheduled scrape stored anything new. */
     const REFRESH_INTERVAL_MS = 60000;
+    /** How closely a manually started scrape is followed, and for how long. */
+    const SCRAPE_POLL_MS = 4000;
+    const SCRAPE_TIMEOUT_MS = 600000;
 
     const M = window.Motion;
 
@@ -896,21 +899,62 @@
     /* Scraping                                                        */
     /* -------------------------------------------------------------- */
 
+    /**
+     * Waits for the run started by `runScrape` to finish, and returns its
+     * summary.
+     *
+     * The scrape is not held open by the request that started it - a crawl
+     * outlives any hosting proxy's patience - so progress is followed through
+     * `/api/status`. A `lastRun` that finished after we started is the run we
+     * asked for; anything older belongs to the scheduler.
+     *
+     * @param {number} startedAt epoch ms, taken before the POST
+     * @returns {Promise<object|null>} the run summary, or null if it outlasted us
+     */
+    async function awaitScrape(startedAt) {
+        const deadline = startedAt + SCRAPE_TIMEOUT_MS;
+
+        while (Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, SCRAPE_POLL_MS));
+
+            let status;
+            try {
+                status = await api('/api/status');
+            } catch {
+                continue; // a free instance can drop a request while it works
+            }
+
+            const finished = status.lastRun?.finishedAt ? Date.parse(status.lastRun.finishedAt) : 0;
+            if (!status.running && finished >= startedAt) return status.lastRun;
+        }
+
+        return null;
+    }
+
     /** Triggers a scrape for the signed-in user and reloads the board. */
     async function runScrape() {
         const label = el.scrapeBtn.querySelector('.btn-label');
         el.scrapeBtn.disabled = true;
         el.scrapeBtn.classList.add('is-busy');
         label.textContent = 'Scraping…';
-        el.footerStatus.textContent = 'Scraping the trusted career pages - this can take a couple of minutes.';
+        el.footerStatus.textContent = 'Searching job boards for your skills - this can take a few minutes.';
+
+        const startedAt = Date.now();
 
         try {
-            const summary = await api('/api/scrape', { method: 'POST' });
-            toast(
-                `Scrape ${summary.status}: ${summary.found} posting(s) found, ${summary.inserted} new.`,
-                summary.status === 'failed' ? 'error' : 'success'
-            );
-            if (summary.errors?.length) console.warn('[scrape] errors:', summary.errors);
+            await api('/api/scrape', { method: 'POST' });
+            const summary = await awaitScrape(startedAt);
+
+            if (!summary) {
+                toast('The scrape is taking a while - it will keep running, and the board updates itself.', 'info');
+            } else {
+                toast(
+                    `Scrape ${summary.status}: ${summary.found} posting(s) found, ${summary.inserted} new.`,
+                    summary.status === 'failed' ? 'error' : 'success'
+                );
+                if (summary.errors?.length) console.warn('[scrape] errors:', summary.errors);
+            }
+
             await Promise.all([loadJobs(), loadStats()]);
         } catch (error) {
             toast(error.message, 'error');

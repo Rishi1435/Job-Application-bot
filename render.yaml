@@ -52,15 +52,24 @@ services:
         sync: false
       - key: NVIDIA_MODEL
         value: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning
-      # Discovery channels. Add `search-crawl` once you are off the free plan.
+      # All three channels. `search-crawl` is listed because it does not need a
+      # browser to work - see SCRAPER_USE_BROWSER below.
       - key: ENABLED_CHANNELS
-        value: ats-api,job-feeds
+        value: ats-api,job-feeds,search-crawl
+      # Chromium in 512 MB gets the process OOM-killed. Off, the search channel
+      # queries engines over plain HTTP instead of rendering them.
+      - key: SCRAPER_USE_BROWSER
+        value: "false"
       - key: CRON_SCHEDULE
         value: 0 */6 * * *
       - key: CRON_TIMEZONE
         value: Asia/Kolkata
+      # A new database has an empty board registry, and on a free instance the
+      # in-process scheduler only runs while somebody is using the site. Scraping
+      # on boot means the first visit already has something to show: the feeds
+      # seed ~48 boards for the ATS channel to walk on the next run.
       - key: RUN_ON_STARTUP
-        value: "false"
+        value: "true"
       # A manual scrape from the dashboard has to answer before Render's proxy
       # gives up on the request, so keep one run small.
       - key: SCRAPER_MAX_BOARDS
