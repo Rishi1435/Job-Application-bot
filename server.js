@@ -329,17 +329,19 @@ async function start() {
 
   await db.initDatabase();
 
-  // A registry with nothing in it means the ATS channel has nowhere to go, and
-  // the first runs see only what the feeds name that day. Seeding is a one-off:
-  // once the registry has boards, this does nothing.
-  const registry = await db.getBoardStats();
-  if (!registry.total) {
-    try {
-      const seeded = await seedBoards();
-      console.log(`[server] Empty board registry - seeded ${seeded.added} previously discovered board(s).`);
-    } catch (error) {
-      console.warn(`[server] Could not seed the board registry: ${error.message}`);
+  // Run on every boot rather than only on an empty registry. A registry can be
+  // populated and still be missing everything that matters - a database seeded
+  // by the feeds alone holds US startups and nothing hiring where the candidate
+  // lives - and a hosted instance usually has no shell to run the script from.
+  // `recordBoards` upserts and never resets `last_scraped_at`, so repeating it
+  // costs a few dozen no-op queries and changes nothing about scrape order.
+  try {
+    const seeded = await seedBoards();
+    if (seeded.added) {
+      console.log(`[server] Seeded ${seeded.added} previously discovered board(s); registry holds ${seeded.total}.`);
     }
+  } catch (error) {
+    console.warn(`[server] Could not seed the board registry: ${error.message}`);
   }
 
   const server = app.listen(PORT, () => {
