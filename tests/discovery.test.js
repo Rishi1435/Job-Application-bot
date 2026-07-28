@@ -244,3 +244,27 @@ test('meetsMatchBar keeps 50 and above', () => {
   assert.equal(meetsMatchBar({}), false);
   assert.equal(meetsMatchBar({ score: 30 }, 25), true, 'the bar is overridable');
 });
+
+/* ------------------------------------------------------------------ */
+/* The board seed                                                      */
+/* ------------------------------------------------------------------ */
+
+test('the seed file only names boards the ATS channel can actually fetch', () => {
+  const path = require('path');
+  const { readSeed } = require('../scripts/seed-boards');
+  const boards = readSeed(path.join(__dirname, '..', 'data', 'boards.seed.json'));
+
+  assert.ok(boards.length > 0, 'the seed should not be empty');
+
+  const known = new Set(Object.keys(require('../config/sources').ATS_PLATFORMS));
+  const seen = new Set();
+
+  for (const board of boards) {
+    assert.ok(known.has(board.platform), `${board.platform} is not a platform the scraper understands`);
+    assert.ok(board.slug && !board.slug.includes(' '), `"${board.slug}" is not a usable slug`);
+
+    const key = `${board.platform}:${board.slug.toLowerCase()}`;
+    assert.ok(!seen.has(key), `${key} appears twice`);
+    seen.add(key);
+  }
+});

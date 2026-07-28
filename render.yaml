@@ -93,6 +93,14 @@ services:
         value: "5"
       - key: MIN_MATCH_SCORE
         value: "50"
+      # Measured on a real run: of eight postings that survived collection, seven
+      # were rejected as "too senior" and none reached the LLM. At 1 an entry
+      # level candidate sees mid level roles only, which on an open crawl of
+      # startup boards is almost nothing. At 2 senior openings come through as a
+      # stretch, scored and capped at 75. Set it back to 1 if the board fills
+      # with roles you would not be called for.
+      - key: RELEVANCE_MAX_LEVEL_STRETCH
+        value: "2"
 
 # Scraping on a schedule that does not depend on anyone visiting the site.
 #

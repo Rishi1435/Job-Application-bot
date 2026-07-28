@@ -27,6 +27,7 @@ const { MODEL, isLlmEnabled, buildSearchQueries, MIN_MATCH_SCORE } = require('./
 const { buildCandidateProfile } = require('./services/relevance');
 const { MIN_LPA_SALARY, MIN_LPA_CTC } = require('./services/compensation');
 const { getEnabledChannels, getTrustedDomains } = require('./config/sources');
+const { seedBoards } = require('./scripts/seed-boards');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -327,6 +328,19 @@ async function start() {
   }
 
   await db.initDatabase();
+
+  // A registry with nothing in it means the ATS channel has nowhere to go, and
+  // the first runs see only what the feeds name that day. Seeding is a one-off:
+  // once the registry has boards, this does nothing.
+  const registry = await db.getBoardStats();
+  if (!registry.total) {
+    try {
+      const seeded = await seedBoards();
+      console.log(`[server] Empty board registry - seeded ${seeded.added} previously discovered board(s).`);
+    } catch (error) {
+      console.warn(`[server] Could not seed the board registry: ${error.message}`);
+    }
+  }
 
   const server = app.listen(PORT, () => {
     console.log(`[server] Dashboard ready at http://localhost:${PORT}`);

@@ -120,6 +120,8 @@ scoring plus a regex categoriser, and says so in the match reason.
 | [scripts/scrape.js](scripts/scrape.js) | `npm run scrape` - CLI run, all users or one |
 | [scripts/rescreen.js](scripts/rescreen.js) | `npm run rescreen` - re-apply the gate to stored postings, no LLM calls |
 | [scripts/prune.js](scripts/prune.js) | `npm run prune` - delete rows the current bars would not have stored (dry run by default) |
+| [scripts/seed-boards.js](scripts/seed-boards.js) | `npm run seed-boards` - load previously discovered boards into an empty registry |
+| [data/boards.seed.json](data/boards.seed.json) | 77 boards earlier crawls found, used to bootstrap a new database |
 | [public/motion.js](public/motion.js) | Framer-Motion-style primitives (springs, stagger, FLIP, presence) on the Web Animations API |
 | [tests/verify.js](tests/verify.js) | `npm run verify` - live Postgres + NVIDIA checks |
 | [tests/](tests/) | `npm test` - offline node:test unit tests (units, compensation, relevance) |
@@ -317,6 +319,22 @@ Only then does the LLM score the posting, and only a verdict of **50 or above**
 is written to the database (`MIN_MATCH_SCORE`). The same floor applies when the
 board is read, so rows stored under an older, lower bar do not resurface -
 `npm run prune` deletes them for good.
+
+### Starting from nothing
+
+Discovery is cumulative: the ATS channel walks `ats_boards`, and every run adds
+to it. An empty registry therefore has a bootstrap problem - the first runs see
+only what the feeds name that day, which is mostly Hacker News' "Who is hiring?"
+thread, which is mostly US startups. A candidate elsewhere then watches the
+location gate reject nearly everything and reasonably concludes the bot is
+broken.
+
+So a database with no boards seeds itself on boot from
+[data/boards.seed.json](data/boards.seed.json), and `npm run seed-boards` does
+it on demand. That file is *output*, not configuration: every board in it was
+found by the search and feed channels on earlier runs. It does not constrain
+what the crawl may discover next, and once the registry is non-empty the seeding
+never runs again.
 
 Rate limits are real and every engine handles them differently: DuckDuckGo
 answers a burst of dorks with HTTP 202 and an interstitial that looks like a
