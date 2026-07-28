@@ -70,12 +70,14 @@ services:
       # seed ~48 boards for the ATS channel to walk on the next run.
       - key: RUN_ON_STARTUP
         value: "true"
-      # A manual scrape from the dashboard has to answer before Render's proxy
-      # gives up on the request, so keep one run small.
+      # The gates are strict on purpose - roughly one posting in ten survives the
+      # relevance, location and match bars - so a small run reliably stores
+      # nothing. These are sized to give each run a real sample. The dashboard no
+      # longer waits on the request, so a longer run costs nothing but time.
       - key: SCRAPER_MAX_BOARDS
-        value: "25"
+        value: "40"
       - key: SCRAPER_MAX_NEW_JOBS
-        value: "60"
+        value: "120"
       - key: MAX_JOBS_PER_SOURCE
         value: "8"
       - key: SCRAPER_MAX_PER_COMPANY

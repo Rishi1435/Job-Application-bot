@@ -900,6 +900,34 @@
     /* -------------------------------------------------------------- */
 
     /**
+     * Describes a finished run in one line, saying where the postings went.
+     *
+     * "8 found, 0 new" is the least useful thing the dashboard can say: it reads
+     * as a failure when it usually means the crawl worked and the bars did their
+     * job. Naming the gate that consumed them turns it into something you can
+     * act on - lower the bar, widen the crawl, or accept the answer.
+     *
+     * @param {object} run summary from /api/status
+     * @returns {string}
+     */
+    function scrapeSummaryText(run) {
+        const found = run.found || 0;
+        const stored = run.inserted || 0;
+
+        if (!found) {
+            return 'Scrape finished: nothing new on the boards it reached. Run it again to reach further.';
+        }
+        if (stored) {
+            return `Scrape ${run.status}: ${found} posting(s) found, ${stored} added to your board.`;
+        }
+
+        const reason = run.belowBar
+            ? `all ${run.belowBar} scored under the match bar`
+            : 'none cleared the filters';
+        return `Scrape ${run.status}: ${found} posting(s) found, ${reason}. Nothing added.`;
+    }
+
+    /**
      * Waits for the run started by `runScrape` to finish, and returns its
      * summary.
      *
@@ -948,10 +976,7 @@
             if (!summary) {
                 toast('The scrape is taking a while - it will keep running, and the board updates itself.', 'info');
             } else {
-                toast(
-                    `Scrape ${summary.status}: ${summary.found} posting(s) found, ${summary.inserted} new.`,
-                    summary.status === 'failed' ? 'error' : 'success'
-                );
+                toast(scrapeSummaryText(summary), summary.status === 'failed' ? 'error' : 'success');
                 if (summary.errors?.length) console.warn('[scrape] errors:', summary.errors);
             }
 
