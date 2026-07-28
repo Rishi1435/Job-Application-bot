@@ -22,7 +22,7 @@ const cron = require('node-cron');
 const db = require('./services/database');
 const auth = require('./services/auth');
 const { extractResumeText, detectResumeKind } = require('./services/parser');
-const { runScraper, runScraperForUser, isRunning, getLastRun } = require('./services/scraper');
+const { runScraper, runScraperForUser, isRunning, runningFor, getLastRun } = require('./services/scraper');
 const { MODEL, isLlmEnabled, buildSearchQueries, MIN_MATCH_SCORE } = require('./services/matcher');
 const { buildCandidateProfile } = require('./services/relevance');
 const { MIN_LPA_SALARY, MIN_LPA_CTC } = require('./services/compensation');
@@ -249,7 +249,14 @@ app.post(
   '/api/scrape',
   auth.requireAuth,
   asyncRoute(async (req, res) => {
-    if (isRunning()) return res.status(409).json({ error: 'A scrape is already running.' });
+    if (isRunning()) {
+      const minutes = Math.floor(runningFor() / 60000);
+      return res.status(409).json({
+        error: minutes
+          ? `A scrape has been running for ${minutes} minute(s). It will finish on its own.`
+          : 'A scrape is already running.',
+      });
+    }
 
     // Deliberately not awaited. `runScraperForUser` handles its own errors and
     // records them on `lastRun`; nothing here can act on a rejection anyway.
@@ -275,6 +282,7 @@ app.get(
 
     res.json({
       running: isRunning(),
+      runningForMs: runningFor(),
       cronSchedule: CRON_SCHEDULE,
       timezone: CRON_TIMEZONE || Intl.DateTimeFormat().resolvedOptions().timeZone,
       matcher: { model: MODEL, llmEnabled: isLlmEnabled(), minScore: MIN_MATCH_SCORE },

@@ -58,7 +58,14 @@ const {
 const { clean, decodeEntities, normalizeDate, absoluteUrl, parseHtml, extractText, extractUserSkills } = require('./parser');
 const { buildCandidateProfile, assessLocation } = require('./relevance');
 const db = require('./database');
-const { matchJobsForUser, buildSearchQueries, meetsMatchBar, verifyMatchShape, MIN_MATCH_SCORE } = require('./matcher');
+const {
+  matchJobsForUser,
+  buildSearchQueries,
+  analyzeResumes,
+  meetsMatchBar,
+  verifyMatchShape,
+  MIN_MATCH_SCORE,
+} = require('./matcher');
 
 const USER_AGENT =
   process.env.SCRAPER_USER_AGENT ||
@@ -114,8 +121,49 @@ const HTML_FALLBACK_LIMIT = Number(process.env.SCRAPER_HTML_FALLBACK_LIMIT || 3)
 
 /** Guards against overlapping runs (cron firing while a manual run is active). */
 let running = false;
+/** When the in-flight run started, so a run that never ends can be recognised. */
+let runStartedAt = 0;
 /** Summary of the most recent run, surfaced by `GET /api/status`. */
 let lastRun = null;
+
+/**
+ * How long a run may claim the lock before it is presumed dead.
+ *
+ * A flag set in memory and cleared in a `finally` is only as reliable as the
+ * process: a container killed or suspended mid-run comes back with the flag
+ * cleared, but a promise that never settles - a socket that neither responds nor
+ * errors - holds it forever, and every later trigger is refused with "a scrape
+ * is already running" until someone restarts the service. Treating a run this
+ * old as abandoned costs at worst one overlapping crawl.
+ */
+const RUN_LOCK_TIMEOUT_MS = Number(process.env.SCRAPER_RUN_TIMEOUT_MS || 20 * 60 * 1000);
+
+/**
+ * How long the in-flight run has been going, in milliseconds. 0 when idle.
+ * @returns {number}
+ */
+function runningFor() {
+  return running && runStartedAt ? Date.now() - runStartedAt : 0;
+}
+
+/**
+ * Whether a run is genuinely in flight, as opposed to one that never finished.
+ * @returns {boolean}
+ */
+function isRunning() {
+  if (!running) return false;
+
+  if (Date.now() - runStartedAt > RUN_LOCK_TIMEOUT_MS) {
+    console.warn(
+      `[scraper] The previous run has held the lock for ${Math.round((Date.now() - runStartedAt) / 60000)} minutes ` +
+        'and is presumed dead; allowing a new one.'
+    );
+    running = false;
+    return false;
+  }
+
+  return true;
+}
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -1362,13 +1410,34 @@ async function buildRunVocabulary(userIds) {
 
   for (const userId of userIds) {
     const resumes = await db.getResumes(userId);
-    const vocabulary = extractUserSkills(resumes);
+
+    // One model call per user per run decides which titles are worth searching
+    // for. Reading the words on the page cannot tell that someone whose projects
+    // are all Spring Boot APIs should be looking for "Backend Engineer" rather
+    // than the "Full Stack Developer" printed at the top of their resume, and
+    // the titles are what every query and dork is built from. Falls back to the
+    // keyword vocabulary by itself if the model is unreachable.
+    const analysis = await analyzeResumes(resumes);
+
     // The country comes from the same profile the relevance gate screens with,
     // so the crawl searches exactly where the gate will accept.
     const { location } = buildCandidateProfile(resumes);
     if (location) locations.add(location);
 
-    perUser[userId] = { ...vocabulary, location };
+    const vocabulary = {
+      skills: analysis.skills,
+      titles: analysis.titles,
+      terms: [...new Set([...analysis.skills, ...analysis.titles])],
+    };
+
+    if (analysis.engine === 'llm') {
+      console.log(
+        `[scraper] user ${userId}: aiming at ${analysis.titles.slice(0, 4).join(', ')}` +
+          `${analysis.summary ? ` - ${analysis.summary}` : ''}`
+      );
+    }
+
+    perUser[userId] = { ...vocabulary, location, seniority: analysis.seniority, summary: analysis.summary };
 
     vocabulary.skills.forEach((skill) => skills.add(skill));
     vocabulary.titles.forEach((title) => titles.add(title));
@@ -1393,7 +1462,7 @@ async function buildRunVocabulary(userIds) {
 async function runScraper(options = {}) {
   const trigger = options.trigger || 'manual';
 
-  if (running) {
+  if (isRunning()) {
     console.warn('[scraper] A run is already in progress; skipping this trigger.');
     return {
       status: 'skipped',
@@ -1408,6 +1477,7 @@ async function runScraper(options = {}) {
   }
 
   running = true;
+  runStartedAt = Date.now();
   const startedAt = new Date();
   const errors = [];
   const totals = { found: 0, inserted: 0, updated: 0, scored: 0, belowBar: 0, users: 0 };
@@ -1545,6 +1615,7 @@ module.exports = {
   normalizeApplyUrl,
   htmlToText,
   launchBrowser,
-  isRunning: () => running,
+  isRunning,
+  runningFor,
   getLastRun: () => lastRun,
 };

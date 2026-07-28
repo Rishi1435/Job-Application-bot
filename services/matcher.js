@@ -525,6 +525,96 @@ function gatedMatch(job, resumes, relevance) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Resume analysis                                                     */
+/* ------------------------------------------------------------------ */
+
+const ANALYST_PROMPT = `You are a technical recruiter deciding which job titles to search for on behalf of a candidate.
+
+Read the resume(s) and answer with JSON only - no prose, no code fences:
+{
+  "target_roles": ["..."],   // 4-8 job titles to search job boards for, most suitable first.
+                             // Use titles as they appear on real postings ("Backend Engineer",
+                             // "Software Engineer Intern"), not descriptions of the person.
+                             // Include the entry rung (Intern/Associate/Graduate/Junior) when
+                             // the candidate is early-career.
+  "core_skills": ["..."],    // up to 12 technologies to match postings against, strongest first.
+                             // Name the technology as a posting would ("Node.js", "Spring Boot").
+  "seniority": "...",        // one of: intern, entry, mid, senior
+  "summary": "..."           // one sentence on what this person should be applying for
+}
+
+Rules:
+- Judge the whole resume: projects and internships count as evidence, coursework barely does.
+- target_roles must be roles this candidate could plausibly be interviewed for today.
+- Never invent a technology the resume does not mention.`;
+
+/**
+ * Asks the model what this candidate should be searching for.
+ *
+ * The regex vocabulary in `extractUserSkills` reads what is written down; it
+ * cannot tell that someone whose projects are all Spring Boot APIs should be
+ * looking at "Backend Engineer" rather than the "Full Stack Developer" printed
+ * at the top of their resume. The model can, and the answer is what the crawl
+ * then searches for - so one call per run shapes every query and dork.
+ *
+ * Falls back to the regex vocabulary on any failure: a run must not depend on
+ * the LLM being reachable.
+ *
+ * @param {Array<{filename?:string, content?:string}>} resumes
+ * @returns {Promise<{titles:Array<string>, skills:Array<string>, seniority:string|null, summary:string|null, engine:string}>}
+ */
+async function analyzeResumes(resumes = []) {
+  const local = extractUserSkills(resumes);
+  const fallback = { titles: local.titles, skills: local.skills, seniority: null, summary: null, engine: 'keyword' };
+
+  if (!client || !resumes.length) return fallback;
+
+  const text = resumes
+    .slice(0, MAX_RESUMES_PER_CALL)
+    .map((resume, i) => `--- RESUME ${i + 1}${resume.filename ? ` (${resume.filename})` : ''} ---\n${String(resume.content || '').slice(0, MAX_RESUME_CHARS)}`)
+    .join('\n\n');
+
+  try {
+    const completion = await client.chat.completions.create({
+      model: MODEL,
+      messages: [
+        { role: 'system', content: ANALYST_PROMPT },
+        { role: 'user', content: text },
+      ],
+      temperature: 0.2, // a search plan should not vary run to run
+      top_p: TOP_P,
+      max_tokens: MAX_TOKENS,
+      reasoning_budget: REASONING_BUDGET,
+    });
+
+    const message = completion?.choices?.[0]?.message || {};
+    const parsed = extractJson(message.content) || extractJson(message.reasoning_content);
+    if (!parsed) throw new Error('no JSON in the reply');
+
+    const clean = (values, cap) =>
+      [...new Set((Array.isArray(values) ? values : []).map((value) => String(value || '').trim()).filter(Boolean))].slice(0, cap);
+
+    const titles = clean(parsed.target_roles, 8);
+    const skills = clean(parsed.core_skills, 12);
+    if (!titles.length && !skills.length) throw new Error('empty analysis');
+
+    return {
+      // The model decides the order; anything it missed that the resume plainly
+      // states is still worth searching for, so the two vocabularies are unioned
+      // rather than swapped.
+      titles: [...new Set([...titles, ...local.titles])].slice(0, 10),
+      skills: [...new Set([...skills, ...local.skills])].slice(0, 14),
+      seniority: parsed.seniority ? String(parsed.seniority).toLowerCase() : null,
+      summary: parsed.summary ? String(parsed.summary).slice(0, 300) : null,
+      engine: 'llm',
+    };
+  } catch (error) {
+    console.warn(`[matcher] Resume analysis fell back to keywords: ${error.message}`);
+    return fallback;
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* Search queries                                                      */
 /* ------------------------------------------------------------------ */
 
@@ -754,6 +844,7 @@ module.exports = {
   matchJob,
   matchJobsForUser,
   buildSearchQueries,
+  analyzeResumes,
   verifyMatchShape,
   meetsMatchBar,
   MIN_MATCH_SCORE,

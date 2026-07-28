@@ -320,6 +320,20 @@ is written to the database (`MIN_MATCH_SCORE`). The same floor applies when the
 board is read, so rows stored under an older, lower bar do not resurface -
 `npm run prune` deletes them for good.
 
+### Deciding what to search for
+
+Before a run crawls anything, the model reads the resumes and answers with the
+job titles this candidate should be applying for, the technologies to match
+postings against, and a seniority. That answer is what every query and dork is
+built from.
+
+Reading the words on the page cannot do this. A resume headed "Full Stack
+Developer" whose projects are all Spring Boot APIs should be searching for
+"Backend Engineer" too, and for "Junior Software Engineer" - a title the resume
+never contains and job boards are full of. One call per user per run, ~10s, and
+it falls back to the keyword vocabulary whenever the model is unreachable, so a
+crawl never depends on it.
+
 ### Starting from nothing
 
 Discovery is cumulative: the ATS channel walks `ats_boards`, and every run adds
