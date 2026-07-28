@@ -396,6 +396,13 @@ the fix is to recreate one of them, or to switch `DATABASE_URL` to the external
 connection string, which is public and works from anywhere at the cost of
 crossing the internet on every query.
 
+The *same* error also appears for a few seconds after a deploy, when the
+container starts before the database's hostname resolves. That one clears itself,
+so `initDatabase()` retries it (`DB_CONNECT_RETRIES`, `DB_CONNECT_DELAY_MS`) and
+only errors on the shapes waiting cannot fix - bad credentials, no such database,
+a TLS mismatch. If a deploy fails with `ENOTFOUND` while the previous deploy is
+still serving traffic happily, it was the race, not the configuration.
+
 ## Tests
 
 ```bash

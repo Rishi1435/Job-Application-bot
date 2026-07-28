@@ -181,19 +181,70 @@ const SCHEMA = [
  *
  * @returns {Promise<void>}
  */
-async function initDatabase() {
+/**
+ * Whether a failed connection is worth trying again.
+ *
+ * DNS and refused connections are the shape of "not ready yet" - on a platform
+ * where the app container and the database start together, the database's
+ * hostname can briefly not resolve. Bad credentials or a missing database are
+ * the shape of "wrong", and no amount of waiting fixes them.
+ *
+ * @param {Error & {code?:string}} error
+ * @returns {boolean}
+ */
+function isTransientConnectionError(error) {
+  const code = error?.code;
+  if (['ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EHOSTUNREACH'].includes(code)) {
+    return true;
+  }
+  // Postgres is up but still starting: "the database system is starting up".
+  if (code === '57P03') return true;
+  // pg wraps parallel address failures; the useful code is on the first error.
+  if (error?.errors?.length) return error.errors.some(isTransientConnectionError);
+  return false;
+}
+
+/**
+ * Connects and creates the schema, waiting out a database that is not up yet.
+ *
+ * Exiting on the first failure makes a deploy fail for a condition that clears
+ * itself in seconds: a container that starts before its database's hostname
+ * resolves dies with `getaddrinfo ENOTFOUND`, the platform records a failed
+ * deploy, and the next attempt succeeds for no visible reason.
+ *
+ * @param {{retries?:number, delayMs?:number}} [options]
+ * @returns {Promise<void>}
+ */
+async function initDatabase(options = {}) {
   if (!CONNECTION_STRING) {
     throw new Error('DATABASE_URL is not set - point it at a PostgreSQL instance.');
   }
 
-  const client = await pool.connect();
-  try {
-    for (const statement of SCHEMA) {
-      await client.query(statement);
+  const retries = Number.isFinite(options.retries) ? options.retries : Number(process.env.DB_CONNECT_RETRIES || 6);
+  let delay = Number.isFinite(options.delayMs) ? options.delayMs : Number(process.env.DB_CONNECT_DELAY_MS || 1000);
+
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      const client = await pool.connect();
+      try {
+        for (const statement of SCHEMA) {
+          await client.query(statement);
+        }
+        console.log('[db] PostgreSQL schema ready.');
+        return;
+      } finally {
+        client.release();
+      }
+    } catch (error) {
+      if (attempt > retries || !isTransientConnectionError(error)) throw error;
+
+      console.warn(
+        `[db] ${error.code || error.message} - database not reachable yet ` +
+          `(attempt ${attempt}/${retries}), retrying in ${delay}ms.`
+      );
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      delay = Math.min(delay * 2, 15000);
     }
-    console.log('[db] PostgreSQL schema ready.');
-  } finally {
-    client.release();
   }
 }
 
@@ -740,6 +791,7 @@ module.exports = {
   pool,
   query,
   initDatabase,
+  isTransientConnectionError,
   // users
   createUser,
   findUserByUsername,

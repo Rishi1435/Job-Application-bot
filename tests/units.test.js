@@ -145,3 +145,20 @@ test('TLS is requested for public database hosts and skipped for private ones', 
   assert.equal(wouldUseTls('postgresql://u:p@db.example.com:5432/jobbot', 'false'), false);
   assert.equal(wouldUseTls('postgresql://u:p@db.example.com:5432/jobbot?sslmode=disable'), false);
 });
+
+test('a database that is not up yet is retried, a misconfigured one is not', () => {
+  const { isTransientConnectionError } = require('../services/database');
+
+  // "Not ready yet" - the shape a container gets when it starts before its
+  // database's hostname resolves.
+  assert.equal(isTransientConnectionError({ code: 'ENOTFOUND' }), true);
+  assert.equal(isTransientConnectionError({ code: 'EAI_AGAIN' }), true);
+  assert.equal(isTransientConnectionError({ code: 'ECONNREFUSED' }), true);
+  assert.equal(isTransientConnectionError({ code: '57P03' }), true, 'starting up');
+  assert.equal(isTransientConnectionError({ errors: [{ code: 'ENOTFOUND' }] }), true, 'wrapped by pg');
+
+  // "Wrong" - waiting cannot fix any of these, so the boot should fail loudly.
+  assert.equal(isTransientConnectionError({ code: '28P01' }), false, 'bad password');
+  assert.equal(isTransientConnectionError({ code: '3D000' }), false, 'no such database');
+  assert.equal(isTransientConnectionError({ message: 'does not support SSL connections' }), false);
+});
