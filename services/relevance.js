@@ -531,6 +531,17 @@ const INDIA_PATTERN =
 const REMOTE_PATTERN = /\b(remote|work\s+from\s+home|wfh|anywhere|distributed|global(ly)?)\b/i;
 
 /**
+ * Whether a posting must name the candidate's country to be eligible.
+ *
+ * Off, an unrestricted "Remote" counts as reachable - which is true in principle
+ * and misleading in practice: on a US board "Remote" nearly always means remote
+ * *within the US*, and a board that is mostly US employers fills with roles that
+ * look open and are not. On, only a posting that says where it is - and says
+ * India - gets through. It is a large reduction in volume, which is the point.
+ */
+const EXCLUDE_REMOTE = String(process.env.EXCLUDE_REMOTE || 'false').toLowerCase() === 'true';
+
+/**
  * Whether one segment of a location is remote *without naming a place*.
  *
  * The distinction matters because "Remote" on its own is open to India, while
@@ -590,10 +601,24 @@ function assessLocation(location, candidateCountry) {
     return { eligible: true, label: text || 'Not stated', note: '' };
   }
 
-  if (!text) return { eligible: true, label: 'Not stated', note: 'Location not listed on the board.' };
+  // Any office in India makes the posting reachable, whatever else it lists -
+  // including "Remote (India)" and "Bengaluru or Remote", which name a place.
+  if (INDIA_PATTERN.test(text)) return { eligible: true, label: text || 'India', note: 'Based in India.' };
 
-  // Any office in India makes the posting reachable, whatever else it lists.
-  if (INDIA_PATTERN.test(text)) return { eligible: true, label: text, note: 'Based in India.' };
+  // With EXCLUDE_REMOTE the posting must *say* it is in the candidate's country.
+  // Placeless remote and an unstated location both fail that: neither can be
+  // confirmed to be a job the candidate can hold, and "Remote" on a US board
+  // overwhelmingly means "remote within the US".
+  if (EXCLUDE_REMOTE) {
+    if (!text) return { eligible: false, label: 'Not stated', note: 'No location stated - not confirmed India.' };
+    const segments = locationSegments(text);
+    if (segments.length && segments.every(isOpenRemote)) {
+      return { eligible: false, label: text, note: `${text} - remote roles are excluded.` };
+    }
+    return { eligible: false, label: text, note: `Based in ${text} - not India.` };
+  }
+
+  if (!text) return { eligible: true, label: 'Not stated', note: 'Location not listed on the board.' };
 
   // Otherwise it is only open if *every* office it names is unrestricted remote.
   const segments = locationSegments(text);

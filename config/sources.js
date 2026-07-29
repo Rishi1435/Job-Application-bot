@@ -328,11 +328,34 @@ const DORK_TEMPLATES = [
  * @param {{skills?:Array<string>, roles?:Array<string>, locations?:Array<string>, platforms?:Array<string>, limit?:number, groupSize?:number}} options
  * @returns {Array<string>} dork strings
  */
+/**
+ * Places to search in, given a country.
+ *
+ * A dork carrying only "India" competes with every page that mentions the word;
+ * the city names are what actually appear in a posting's location field, so they
+ * are the terms that find offices rather than mentions. Workday takes these as
+ * its `searchText` for the same reason.
+ */
+const LOCATION_TERMS = {
+  India: ['India', 'Bengaluru', 'Hyderabad', 'Pune', 'Chennai', 'Gurgaon', 'Noida', 'Mumbai'],
+};
+
+/**
+ * Expands a country into the search terms worth issuing for it.
+ *
+ * @param {Array<string>} locations
+ * @returns {Array<string>}
+ */
+function expandLocations(locations = []) {
+  const expanded = locations.flatMap((location) => LOCATION_TERMS[location] || [location]);
+  return [...new Set(expanded.filter(Boolean))];
+}
+
 function buildDorks(options = {}) {
   const skills = (options.skills || []).filter(Boolean);
   const roles = options.roles && options.roles.length ? options.roles : ROLE_TERMS;
   const platforms = options.platforms && options.platforms.length ? options.platforms : Object.keys(ATS_PLATFORMS);
-  const locations = (options.locations || []).filter(Boolean);
+  const locations = expandLocations((options.locations || []).filter(Boolean));
   const groupSize = Math.max(1, options.groupSize || 3);
   const limit = Math.max(1, options.limit || 12);
 
@@ -354,9 +377,10 @@ function buildDorks(options = {}) {
     for (const site of sites) {
       if (dorks.length >= limit) break;
       const template = DORK_TEMPLATES[round % DORK_TEMPLATES.length];
-      // Every other dork carries the candidate's country, so the discovered set
-      // is a mix of "anywhere" and "somewhere they can be hired".
-      const place = locations.length && dorks.length % 2 === 1 ? ` ${locations[round % locations.length]}` : '';
+      // Most dorks carry a place the candidate can be hired in, cycling through
+      // the cities rather than repeating the country. One in three stays
+      // placeless so the crawl still turns up boards it would otherwise miss.
+      const place = locations.length && dorks.length % 3 !== 0 ? ` ${locations[dorks.length % locations.length]}` : '';
       const dork = `${template
         .replace('{site}', site)
         .replace('{skills}', groups[round % groups.length])
@@ -599,6 +623,8 @@ module.exports = {
   QUERY_TEMPLATES,
   DORK_TEMPLATES,
   buildDorks,
+  expandLocations,
+  LOCATION_TERMS,
   SEARCH_ENGINES,
   getSearchEngines,
   // channels

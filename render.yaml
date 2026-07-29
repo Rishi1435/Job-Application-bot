@@ -101,6 +101,13 @@ services:
       # with roles you would not be called for.
       - key: RELEVANCE_MAX_LEVEL_STRETCH
         value: "2"
+      # Only postings that name a location in the candidate's country. "Remote"
+      # on a US board almost always means remote within the US, so accepting it
+      # fills the board with roles that look open and are not. This is a large
+      # cut in volume - set it to false to let genuinely worldwide-remote and
+      # location-less postings back in.
+      - key: EXCLUDE_REMOTE
+        value: "true"
 
 # Scraping on a schedule that does not depend on anyone visiting the site.
 #

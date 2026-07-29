@@ -26,7 +26,7 @@
 
 const { OpenAI } = require('openai');
 
-const { ROLE_TERMS, QUERY_TEMPLATES } = require('../config/sources');
+const { ROLE_TERMS, QUERY_TEMPLATES, expandLocations } = require('../config/sources');
 const { getResumes } = require('./database');
 const { extractUserSkills } = require('./parser');
 const { parseCompensation, meetsPayBar } = require('./compensation');
@@ -677,7 +677,7 @@ function buildSearchQueries(input, options = {}) {
   // Where they can actually be hired. Workday takes these strings as its
   // `searchText`, so a country here is the difference between a page of roles
   // the candidate can take and a page the location gate will throw away.
-  for (const location of locations) {
+  for (const location of expandLocations(locations)) {
     for (const title of titles.slice(0, 2)) add(`${title} ${location}`);
     for (const skill of skills.slice(0, 2)) add(`${skill} Developer ${location}`);
   }

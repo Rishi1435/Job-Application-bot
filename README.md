@@ -158,6 +158,7 @@ list. The ones that matter most:
 | `SCRAPER_MAX_PER_COMPANY` | `5` | Cap per employer across the whole run, counted by company name |
 | `SEARCH_ENGINE` | all four | Restrict the search crawl, e.g. `brave,duckduckgo-html` |
 | `RELEVANCE_MAX_LEVEL_STRETCH` | `1` | How many rungs above the candidate a posting may sit |
+| `EXCLUDE_REMOTE` | `false` | Require a posting to name a location in the candidate's country. `Remote (India)` still counts; a bare `Remote` does not |
 | `CRON_SCHEDULE` | `*/30 * * * *` | Every 30 minutes, for all tenants. Any 5-field cron expression |
 | `RUN_ON_STARTUP` | `false` | Scrape once on boot |
 | `PORT` | `3000` | HTTP port |

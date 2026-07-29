@@ -322,3 +322,50 @@ test('normalizeApplyUrl canonicalises redirecting hosts and strips tracking', ()
   assert.equal(normalizeApplyUrl('not a url'), null);
   assert.equal(normalizeApplyUrl(''), null);
 });
+
+/* ------------------------------------------------------------------ */
+/* EXCLUDE_REMOTE                                                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Reloads the gate under a given EXCLUDE_REMOTE setting; the module reads the
+ * environment once at load.
+ *
+ * @param {boolean} strict
+ * @returns {(text:string) => {eligible:boolean, note:string}}
+ */
+function locationGate(strict) {
+  const path = require.resolve('../services/relevance');
+  delete require.cache[path];
+  process.env.EXCLUDE_REMOTE = String(strict);
+  const { assessLocation } = require(path);
+  delete require.cache[path];
+  return (text) => assessLocation(text, 'India');
+}
+
+test('EXCLUDE_REMOTE keeps Indian offices and drops placeless remote', () => {
+  const previous = process.env.EXCLUDE_REMOTE;
+  try {
+    const strict = locationGate(true);
+
+    // A named Indian location still passes, however the posting words it.
+    for (const text of ['Bengaluru, India', 'Hyderabad', 'Remote (India)', 'Bengaluru or Remote']) {
+      assert.equal(strict(text).eligible, true, `${text} should be kept`);
+    }
+
+    // "Remote" on a US board means remote within the US far more often than it
+    // means open to India, and an unstated location cannot be confirmed at all.
+    for (const text of ['Remote', 'Remote - US', 'Remote - Worldwide', 'San Francisco, CA', '']) {
+      assert.equal(strict(text).eligible, false, `${text} should be dropped`);
+    }
+
+    // Default behaviour is unchanged: remote and unstated stay eligible.
+    const lenient = locationGate(false);
+    assert.equal(lenient('Remote').eligible, true);
+    assert.equal(lenient('').eligible, true);
+    assert.equal(lenient('Remote - US').eligible, false, 'a US-only remote role is still not India');
+  } finally {
+    if (previous === undefined) delete process.env.EXCLUDE_REMOTE;
+    else process.env.EXCLUDE_REMOTE = previous;
+  }
+});
