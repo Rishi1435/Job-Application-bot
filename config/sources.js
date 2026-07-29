@@ -51,7 +51,7 @@ const ATS_DOMAINS = ['greenhouse.io', 'lever.co', 'ashbyhq.com', 'workday.com', 
  *
  * @type {Array<string>}
  */
-const FEED_DOMAINS = ['remoteok.com', 'arbeitnow.com', 'ycombinator.com'];
+const FEED_DOMAINS = ['remoteok.com', 'arbeitnow.com', 'ycombinator.com', 'adzuna.com', 'adzuna.in'];
 
 /**
  * The active domain allow-list, honouring the TRUSTED_ATS_DOMAINS override.
@@ -262,6 +262,24 @@ const JOB_FEEDS = [
     kind: 'hackernews',
     url: 'https://hn.algolia.com/api/v1/search_by_date?tags=story,author_whoishiring&hitsPerPage=6',
     boardsOnly: true,
+  },
+  /**
+   * The only source here that answers the two questions the ATS boards cannot:
+   * *where in India* and *how much*. Adzuna runs a country-specific index
+   * (`.../jobs/in/search/...` is India) and returns `salary_min`/`salary_max` in
+   * rupees on a large share of postings, where Greenhouse and Lever state pay on
+   * roughly one posting in eight.
+   *
+   * Needs a free key from https://developer.adzuna.com - the feed is skipped
+   * entirely when ADZUNA_APP_ID / ADZUNA_APP_KEY are unset, so nothing breaks
+   * without one.
+   */
+  {
+    id: 'adzuna',
+    label: 'Adzuna India',
+    kind: 'adzuna',
+    url: 'https://api.adzuna.com/v1/api/jobs/{country}/search/{page}',
+    requiresKeys: ['ADZUNA_APP_ID', 'ADZUNA_APP_KEY'],
   },
 ];
 

@@ -14,7 +14,7 @@ resumes ─▶ skills & titles ─▶ search queries
         ▼                          ▼                          ▼
   ATS search APIs           developer job feeds       search-engine dorks
   (Greenhouse, Lever,       (RemoteOK, Arbeitnow,     (Puppeteer ─▶ DuckDuckGo,
-   Ashby, Workday)           HN "Who is hiring?")      discovers new boards)
+   Ashby, Workday)           Adzuna, HN "hiring?")     discovers new boards)
         └──────────────────────────┼──────────────────────────┘
                                    ▼
         trusted-ATS-domain filter ─▶ skill filter ─▶ already-seen filter
@@ -42,8 +42,9 @@ resumes ─▶ skills & titles ─▶ search queries
   `searchText` sent to Workday, and the keyword filter every listing has to pass.
   Two candidates with different stacks reach two different sets of employers.
 - **Three discovery channels** - public ATS APIs (Greenhouse, Lever, Ashby,
-  Workday), open developer feeds (RemoteOK, Arbeitnow, the Hacker News "Who is
-  hiring?" thread), and Puppeteer-driven search-engine crawling. Every career
+  Workday), open developer feeds (RemoteOK, Arbeitnow, Adzuna's country index,
+  the Hacker News "Who is hiring?" thread), and Puppeteer-driven search-engine
+  crawling. Every career
   page found is remembered in the `ats_boards` table and revisited
   least-recently-first, so the reach of a run grows with every crawl.
 - **Trusted ATS domains** - a discovered URL is only followed when it lives on a
@@ -158,6 +159,7 @@ list. The ones that matter most:
 | `SCRAPER_MAX_PER_COMPANY` | `5` | Cap per employer across the whole run, counted by company name |
 | `SEARCH_ENGINE` | all four | Restrict the search crawl, e.g. `brave,duckduckgo-html` |
 | `RELEVANCE_MAX_LEVEL_STRETCH` | `1` | How many rungs above the candidate a posting may sit |
+| `ADZUNA_APP_ID` / `ADZUNA_APP_KEY` | *(unset)* | Free key from developer.adzuna.com. Enables the one feed that searches India directly and reports pay |
 | `EXCLUDE_REMOTE` | `false` | Require a posting to name a location in the candidate's country. `Remote (India)` still counts; a bare `Remote` does not |
 | `CRON_SCHEDULE` | `*/30 * * * *` | Every 30 minutes, for all tenants. Any 5-field cron expression |
 | `RUN_ON_STARTUP` | `false` | Scrape once on boot |

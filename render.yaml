@@ -108,6 +108,15 @@ services:
       # location-less postings back in.
       - key: EXCLUDE_REMOTE
         value: "true"
+      # Adzuna's India index - the one source that answers "where in India" and
+      # "how much" together. Free key from https://developer.adzuna.com; the feed
+      # is skipped entirely while these are unset.
+      - key: ADZUNA_APP_ID
+        sync: false
+      - key: ADZUNA_APP_KEY
+        sync: false
+      - key: ADZUNA_COUNTRY
+        value: in
 
 # Scraping on a schedule that does not depend on anyone visiting the site.
 #

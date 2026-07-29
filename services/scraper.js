@@ -775,8 +775,79 @@ async function fetchHackerNewsBoards(feed) {
  *
  * @returns {Promise<{jobs:Array<object>, boards:Array<object>, errors:Array<string>}>}
  */
-async function collectFromFeeds() {
-  const readers = { remoteok: fetchRemoteOkFeed, arbeitnow: fetchArbeitnowFeed };
+/** Country index to search. Adzuna runs one per market; `in` is India. */
+const ADZUNA_COUNTRY = process.env.ADZUNA_COUNTRY || 'in';
+/** Queries issued per run. Each is one request against the free tier's quota. */
+const ADZUNA_QUERIES = Number(process.env.ADZUNA_MAX_QUERIES || 4);
+const ADZUNA_PER_QUERY = Number(process.env.ADZUNA_RESULTS_PER_QUERY || 20);
+
+/**
+ * Reads Adzuna's country index for the run's own search queries.
+ *
+ * This is the only source that answers both of the questions the ATS boards
+ * leave open. It is searched by *country index* rather than filtered afterwards,
+ * so every result is already in India, and it reports `salary_min`/`salary_max`
+ * on a large share of postings - the ATS boards state pay on about one in eight.
+ *
+ * The figures come back as plain annual rupees, so they are written into the
+ * description in a form `parseCompensation` already reads rather than through a
+ * second, parallel path.
+ *
+ * @param {object} feed entry from JOB_FEEDS
+ * @param {Array<string>} queries the run's search queries
+ * @returns {Promise<Array<object>>}
+ */
+async function fetchAdzunaFeed(feed, queries = []) {
+  const appId = process.env.ADZUNA_APP_ID;
+  const appKey = process.env.ADZUNA_APP_KEY;
+  if (!appId || !appKey) return [];
+
+  const terms = (queries.length ? queries : ['Software Engineer']).slice(0, Math.max(1, ADZUNA_QUERIES));
+  const jobs = [];
+
+  for (const term of terms) {
+    const url =
+      feed.url.replace('{country}', encodeURIComponent(ADZUNA_COUNTRY)).replace('{page}', '1') +
+      `?app_id=${encodeURIComponent(appId)}&app_key=${encodeURIComponent(appKey)}` +
+      `&results_per_page=${ADZUNA_PER_QUERY}&what=${encodeURIComponent(term)}` +
+      '&content-type=application/json';
+
+    const payload = await fetchJson(url);
+    if (!payload || !Array.isArray(payload.results)) continue;
+
+    for (const row of payload.results) {
+      // Adzuna reports a single figure as min === max; a missing one as null.
+      const min = Number(row.salary_min);
+      const max = Number(row.salary_max);
+      const pay =
+        Number.isFinite(min) && min > 0
+          ? `Salary: ₹${Math.round(min).toLocaleString('en-IN')}${
+              Number.isFinite(max) && max > min ? ` - ₹${Math.round(max).toLocaleString('en-IN')}` : ''
+            } per year`
+          : '';
+
+      jobs.push(
+        toJob({
+          title: row.title,
+          company: row.company?.display_name,
+          location: row.location?.display_name,
+          // Pay first so it survives the description truncation the matcher applies.
+          description: [pay, htmlToText(row.description || '')].filter(Boolean).join('\n'),
+          applyUrl: row.redirect_url,
+          datePosted: row.created,
+          sourceId: `feed:${feed.id}`,
+        })
+      );
+    }
+
+    await politeDelay();
+  }
+
+  return jobs;
+}
+
+async function collectFromFeeds(queries = []) {
+  const readers = { remoteok: fetchRemoteOkFeed, arbeitnow: fetchArbeitnowFeed, adzuna: fetchAdzunaFeed };
   const jobs = [];
   const boards = [];
   const errors = [];
@@ -793,7 +864,13 @@ async function collectFromFeeds() {
       const reader = readers[feed.kind];
       if (!reader) continue;
 
-      const found = await reader(feed);
+      // A feed that needs credentials is skipped in silence when they are unset,
+      // rather than failing a run that never asked for it.
+      if ((feed.requiresKeys || []).some((key) => !process.env[key])) {
+        continue;
+      }
+
+      const found = await reader(feed, queries);
       jobs.push(...found);
       console.log(`[scraper] ${feed.label}: ${found.length} listing(s).`);
     } catch (error) {
@@ -1180,7 +1257,7 @@ async function collectJobs(options = {}) {
     /* --- channel B: feeds ------------------------------------------ */
     let feedJobs = [];
     if (isChannelEnabled('job-feeds')) {
-      const feeds = await collectFromFeeds();
+      const feeds = await collectFromFeeds(queries);
       errors.push(...feeds.errors);
       discovered.push(...feeds.boards);
       feedJobs = feeds.jobs;
@@ -1604,6 +1681,7 @@ module.exports = {
   fetchAshbyBoard,
   fetchWorkdayBoard,
   collectFromFeeds,
+  fetchAdzunaFeed,
   discoverBoards,
   extractBoardsFromResults,
   looksThrottled,
